@@ -5,6 +5,7 @@
 #
 # +-------------------------------------------------------------+
 
+import json
 import os
 import uuid
 from typing import (
@@ -219,12 +220,32 @@ class LassoGuardrail(CustomGuardrail):
 
         # Extract messages from the response for validation
         if isinstance(response, litellm.ModelResponse):
-            response_messages = []
+            response_messages: List[Dict[str, Any]] = []
             for choice in response.choices:
-                if hasattr(choice, "message") and choice.message.content:
-                    response_messages.append(
-                        {"role": "assistant", "content": choice.message.content}
-                    )
+                if not hasattr(choice, "message"):
+                    continue
+                msg = choice.message
+                if msg.content:
+                    response_messages.append({"role": "assistant", "content": msg.content})
+                for call in getattr(msg, "tool_calls", None) or []:
+                    call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+                    func = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+                    name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
+                    args_str = func.get("arguments") if isinstance(func, dict) else getattr(func, "arguments", None)
+                    if not call_id or not name:
+                        continue
+                    input_data = None
+                    if args_str:
+                        try:
+                            parsed = json.loads(args_str)
+                            if isinstance(parsed, dict):
+                                input_data = parsed
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    response_messages.append({
+                        "role": "assistant",
+                        "content": {"type": "tool_use", "id": call_id, "name": name, "input": input_data},
+                    })
 
             if response_messages:
                 # Include litellm_call_id from original data for conversation_id consistency
@@ -366,9 +387,10 @@ class LassoGuardrail(CustomGuardrail):
             LassoGuardrailAPIError: If the Lasso API call fails
             HTTPException: If blocking violations are detected
         """
-        messages: List[Dict[str, str]] = data.get("messages", [])
+        messages: List[Dict[str, Any]] = data.get("messages", [])
         if not messages:
             return data
+        messages = self._expand_messages_for_classification(messages)
 
         if self.mask:
             return await self._handle_masking(data, cache, message_type, messages)
@@ -382,7 +404,7 @@ class LassoGuardrail(CustomGuardrail):
         data: dict,
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"],
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
     ) -> dict:
         """Handle classification without masking."""
         try:
@@ -400,7 +422,7 @@ class LassoGuardrail(CustomGuardrail):
         data: dict,
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"],
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
     ) -> dict:
         """Handle masking with classifix endpoint."""
         try:
@@ -478,6 +500,68 @@ class LassoGuardrail(CustomGuardrail):
             },
         )
 
+    def _expand_messages_for_classification(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert raw OpenAI-format messages to Lasso API format with content blocks.
+
+        - assistant messages with `tool_calls` → assistant message per tool_use block
+        - role=tool messages → developer role + tool_result block
+        - plain text messages pass through unchanged
+        """
+        expanded: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content")
+
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if not tool_call_id:
+                    verbose_proxy_logger.warning("Skipping tool message without tool_call_id")
+                    continue
+                expanded.append({
+                    "role": "developer",
+                    "content": {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content or "",
+                    },
+                })
+                continue
+
+            if content:
+                expanded.append({"role": role, "content": content})
+
+            if role == "assistant":
+                for call in msg.get("tool_calls") or []:
+                    call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+                    func = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+                    if not func:
+                        continue
+                    name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
+                    args_str = func.get("arguments") if isinstance(func, dict) else getattr(func, "arguments", None)
+                    if not call_id or not name:
+                        verbose_proxy_logger.warning(
+                            "Skipping malformed tool_call",
+                            extra={"call_id": call_id, "name": name},
+                        )
+                        continue
+                    input_data = None
+                    if args_str:
+                        try:
+                            parsed = json.loads(args_str)
+                            if isinstance(parsed, dict):
+                                input_data = parsed
+                        except (json.JSONDecodeError, TypeError):
+                            verbose_proxy_logger.warning("Failed to parse tool_call arguments, dropping input")
+                    expanded.append({
+                        "role": "assistant",
+                        "content": {"type": "tool_use", "id": call_id, "name": name, "input": input_data},
+                    })
+
+        return expanded
+
     def _prepare_headers(self, data: dict, cache: DualCache) -> Dict[str, str]:
         """Prepare headers for the Lasso API request."""
         if not self.lasso_api_key:
@@ -504,7 +588,7 @@ class LassoGuardrail(CustomGuardrail):
 
     def _prepare_payload(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         data: dict,
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"] = "PROMPT",
@@ -513,9 +597,9 @@ class LassoGuardrail(CustomGuardrail):
         Prepare the payload for the Lasso API request.
 
         Args:
-            messages: List of message objects
+            messages: List of message objects (may contain tool_use/tool_result content blocks)
             message_type: Type of message - "PROMPT" for input, "COMPLETION" for output
-            data: Request data (used for conversation_id generation)
+            data: Request data (used for conversation_id generation and tools extraction)
             cache: Cache instance for storing conversation_id (optional for post-call)
         """
         payload: Dict[str, Any] = {"messages": messages, "messageType": message_type}
@@ -526,8 +610,29 @@ class LassoGuardrail(CustomGuardrail):
 
         # Always include sessionId (conversation_id - generated or provided)
         conversation_id = self._get_or_generate_conversation_id(data, cache)
-
         payload["sessionId"] = conversation_id
+
+        # Map OpenAI ChatCompletionToolParam array → ToolDefinition array
+        tools_data: List[Dict[str, Any]] = data.get("tools") or []
+        if tools_data:
+            tool_definitions = []
+            for tool in tools_data:
+                func = tool.get("function") if isinstance(tool, dict) else getattr(tool, "function", None)
+                if not func:
+                    continue
+                name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
+                if not name:
+                    continue
+                td: Dict[str, Any] = {"name": name}
+                description = func.get("description") if isinstance(func, dict) else getattr(func, "description", None)
+                if description:
+                    td["description"] = description
+                parameters = func.get("parameters") if isinstance(func, dict) else getattr(func, "parameters", None)
+                if parameters:
+                    td["parameters"] = parameters
+                tool_definitions.append(td)
+            if tool_definitions:
+                payload["tools"] = tool_definitions
 
         return payload
 
