@@ -554,10 +554,15 @@ class LassoGuardrail(CustomGuardrail):
             if call_id and call_id in masked_tool_use:
                 masked_input = masked_tool_use[call_id].get("input")
                 if masked_input is not None:
-                    call = dict(call) if isinstance(call, dict) else call
-                    func = dict(call.get("function", {}))
-                    func["arguments"] = json.dumps(masked_input)
-                    call["function"] = func
+                    if isinstance(call, dict):
+                        call = dict(call)
+                        func = dict(call.get("function", {}))
+                        func["arguments"] = json.dumps(masked_input)
+                        call["function"] = func
+                    else:
+                        func = getattr(call, "function", None)
+                        if func:
+                            func.arguments = json.dumps(masked_input)
             updated.append(call)
         return updated
 
