@@ -430,7 +430,9 @@ class LassoGuardrail(CustomGuardrail):
         """
         raw_messages: List[Dict[str, Any]] = data.get("messages") or []
         messages: List[Dict[str, Any]] = (
-            self._expand_messages_for_classification(raw_messages) if raw_messages else []
+            self._expand_messages_for_classification(raw_messages)
+            if raw_messages
+            else []
         )
         messages_count = len(messages)
         if data.get("input") is not None:
@@ -750,11 +752,18 @@ class LassoGuardrail(CustomGuardrail):
                 text_parts = [
                     part["text"]
                     for part in content
-                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+                    if isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and part.get("text")
                 ]
                 if text_parts:
                     expanded.append({"role": role, "content": "\n".join(text_parts)})
             elif content:
+                # Empty string and ``None`` are skipped on purpose: empty
+                # carries no inspectable text and ``None`` is the standard
+                # OpenAI shape for a pure tool-call turn. Dict content
+                # (pre-built tool_use/tool_result blocks from the post-call
+                # path) passes through unchanged.
                 expanded.append({"role": role, "content": content})
 
             if role == "assistant":
