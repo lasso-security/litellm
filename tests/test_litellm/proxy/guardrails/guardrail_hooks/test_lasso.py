@@ -942,6 +942,22 @@ class TestLassoGuardrail:
             "content": {"type": "tool_result", "tool_use_id": "call_abc", "content": "72°F, sunny"},
         }
 
+    def test_expand_messages_tool_role_list_content(self):
+        """Pre-call: tool message with multimodal list content is flattened to a string."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "content": [
+                    {"type": "text", "text": "72°F"},
+                    {"type": "text", "text": "sunny"},
+                ],
+            }
+        ]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert expanded[0]["content"]["content"] == "72°F\nsunny"
+
     def test_expand_messages_tool_role_missing_tool_call_id(self):
         """Pre-call: tool message without tool_call_id is skipped with a warning."""
         guardrail = LassoGuardrail(lasso_api_key="test-api-key")

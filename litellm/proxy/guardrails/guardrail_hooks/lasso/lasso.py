@@ -687,13 +687,26 @@ class LassoGuardrail(CustomGuardrail):
                         "Skipping tool message without tool_call_id"
                     )
                     continue
+                # Flatten multimodal list content to text so Lasso's
+                # tool_result.content field receives a string.
+                if isinstance(content, list):
+                    text_parts = [
+                        part["text"]
+                        for part in content
+                        if isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and part.get("text")
+                    ]
+                    tool_result_content = "\n".join(text_parts)
+                else:
+                    tool_result_content = content or ""
                 expanded.append(
                     {
                         "role": "developer",
                         "content": {
                             "type": "tool_result",
                             "tool_use_id": tool_call_id,
-                            "content": content or "",
+                            "content": tool_result_content,
                         },
                     }
                 )
