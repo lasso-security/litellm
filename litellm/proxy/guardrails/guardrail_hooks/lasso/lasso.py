@@ -231,12 +231,30 @@ class LassoGuardrail(CustomGuardrail):
                     continue
                 msg = choice.message
                 if msg.content:
-                    response_messages.append({"role": "assistant", "content": msg.content})
+                    response_messages.append(
+                        {"role": "assistant", "content": msg.content}
+                    )
                 for call in getattr(msg, "tool_calls", None) or []:
-                    call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
-                    func = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
-                    name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
-                    args_str = func.get("arguments") if isinstance(func, dict) else getattr(func, "arguments", None)
+                    call_id = (
+                        call.get("id")
+                        if isinstance(call, dict)
+                        else getattr(call, "id", None)
+                    )
+                    func = (
+                        call.get("function")
+                        if isinstance(call, dict)
+                        else getattr(call, "function", None)
+                    )
+                    name = (
+                        func.get("name")
+                        if isinstance(func, dict)
+                        else getattr(func, "name", None)
+                    )
+                    args_str = (
+                        func.get("arguments")
+                        if isinstance(func, dict)
+                        else getattr(func, "arguments", None)
+                    )
                     if not call_id or not name:
                         continue
                     input_data = None
@@ -246,11 +264,20 @@ class LassoGuardrail(CustomGuardrail):
                             if isinstance(parsed, dict):
                                 input_data = parsed
                         except (json.JSONDecodeError, TypeError):
-                            pass
-                    response_messages.append({
-                        "role": "assistant",
-                        "content": {"type": "tool_use", "id": call_id, "name": name, "input": input_data},
-                    })
+                            verbose_proxy_logger.debug(
+                                "Failed to parse tool_call arguments as JSON, sending null input"
+                            )
+                    response_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": {
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": input_data,
+                            },
+                        }
+                    )
 
             if response_messages:
                 # Include litellm_call_id from original data for conversation_id consistency
@@ -396,6 +423,8 @@ class LassoGuardrail(CustomGuardrail):
         if not messages:
             return data
         messages = self._expand_messages_for_classification(messages)
+        if not messages:
+            return data
 
         # Lasso's classifix endpoint returns masked text that we copy back
         # into ``data["messages"]``. For multimodal/Responses-API input we
@@ -441,16 +470,103 @@ class LassoGuardrail(CustomGuardrail):
             )
             self._process_lasso_response(response)
 
-            # Apply masking to messages if violations detected and masked messages are available
-            redacted_messages = response.get("messages")
-            if response.get("violations_detected") and redacted_messages:
-                apply_redacted_messages_back(data, list(redacted_messages))
+            # Apply masking to messages if violations detected and masked messages are available.
+            # Map masked content back onto the original OpenAI-format messages so the
+            # downstream provider receives a compatible payload.
+            if response.get("violations_detected") and response.get("messages"):
+                data["messages"] = self._map_masked_messages_back(
+                    data["messages"], response["messages"]
+                )
                 self._log_masking_applied(message_type, dict(response))
 
             return data
         except Exception as e:
             await self._handle_api_error(e, message_type)
             return data  # This line won't be reached due to exception, but satisfies type checker
+
+    def _map_masked_messages_back(
+        self,
+        original_messages: List[Dict[str, Any]],
+        masked_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Map Lasso-format masked messages back onto the original OpenAI-format messages.
+
+        Lasso receives expanded messages (tool_use / tool_result blocks) and returns them
+        in the same Lasso-internal format with sensitive values replaced.  Writing those
+        blocks straight into data["messages"] would corrupt the OpenAI-compatible schema
+        the downstream provider expects.  This helper re-applies only the masked content
+        while preserving the original structure.
+        """
+        # Index masked content by type so we can look up by id without caring about order.
+        masked_tool_use: Dict[str, Dict[str, Any]] = {}
+        masked_tool_result: Dict[str, str] = {}
+        masked_text: List[str] = []
+
+        for msg in masked_messages:
+            content = msg.get("content")
+            if isinstance(content, dict):
+                if content.get("type") == "tool_use":
+                    call_id = content.get("id")
+                    if call_id:
+                        masked_tool_use[call_id] = content
+                elif content.get("type") == "tool_result":
+                    tool_use_id = content.get("tool_use_id")
+                    if tool_use_id:
+                        masked_tool_result[tool_use_id] = content.get("content", "")
+            elif isinstance(content, str):
+                masked_text.append(content)
+
+        result: List[Dict[str, Any]] = []
+        text_cursor = 0
+
+        for orig_msg in original_messages:
+            msg = dict(orig_msg)
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id and tool_call_id in masked_tool_result:
+                    msg["content"] = masked_tool_result[tool_call_id]
+
+            elif isinstance(content, str) and content:
+                if text_cursor < len(masked_text):
+                    msg["content"] = masked_text[text_cursor]
+                    text_cursor += 1
+                if role == "assistant" and orig_msg.get("tool_calls"):
+                    msg["tool_calls"] = self._update_tool_calls_from_masked(
+                        orig_msg["tool_calls"], masked_tool_use
+                    )
+
+            elif role == "assistant" and not content and orig_msg.get("tool_calls"):
+                msg["tool_calls"] = self._update_tool_calls_from_masked(
+                    orig_msg["tool_calls"], masked_tool_use
+                )
+
+            result.append(msg)
+
+        return result
+
+    def _update_tool_calls_from_masked(
+        self,
+        tool_calls: List[Any],
+        masked_tool_use: Dict[str, Dict[str, Any]],
+    ) -> List[Any]:
+        """Replace tool_call arguments with masked values returned by Lasso."""
+        updated = []
+        for call in tool_calls:
+            call_id = (
+                call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            )
+            if call_id and call_id in masked_tool_use:
+                masked_input = masked_tool_use[call_id].get("input")
+                if masked_input is not None:
+                    call = dict(call) if isinstance(call, dict) else call
+                    func = dict(call.get("function", {}))
+                    func["arguments"] = json.dumps(masked_input)
+                    call["function"] = func
+            updated.append(call)
+        return updated
 
     async def _handle_api_error(
         self,
@@ -526,16 +642,20 @@ class LassoGuardrail(CustomGuardrail):
             if role == "tool":
                 tool_call_id = msg.get("tool_call_id")
                 if not tool_call_id:
-                    verbose_proxy_logger.warning("Skipping tool message without tool_call_id")
+                    verbose_proxy_logger.warning(
+                        "Skipping tool message without tool_call_id"
+                    )
                     continue
-                expanded.append({
-                    "role": "developer",
-                    "content": {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": content or "",
-                    },
-                })
+                expanded.append(
+                    {
+                        "role": "developer",
+                        "content": {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": content or "",
+                        },
+                    }
+                )
                 continue
 
             if content:
@@ -543,12 +663,28 @@ class LassoGuardrail(CustomGuardrail):
 
             if role == "assistant":
                 for call in msg.get("tool_calls") or []:
-                    call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
-                    func = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+                    call_id = (
+                        call.get("id")
+                        if isinstance(call, dict)
+                        else getattr(call, "id", None)
+                    )
+                    func = (
+                        call.get("function")
+                        if isinstance(call, dict)
+                        else getattr(call, "function", None)
+                    )
                     if not func:
                         continue
-                    name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
-                    args_str = func.get("arguments") if isinstance(func, dict) else getattr(func, "arguments", None)
+                    name = (
+                        func.get("name")
+                        if isinstance(func, dict)
+                        else getattr(func, "name", None)
+                    )
+                    args_str = (
+                        func.get("arguments")
+                        if isinstance(func, dict)
+                        else getattr(func, "arguments", None)
+                    )
                     if not call_id or not name:
                         verbose_proxy_logger.warning(
                             "Skipping malformed tool_call",
@@ -562,11 +698,20 @@ class LassoGuardrail(CustomGuardrail):
                             if isinstance(parsed, dict):
                                 input_data = parsed
                         except (json.JSONDecodeError, TypeError):
-                            verbose_proxy_logger.warning("Failed to parse tool_call arguments, dropping input")
-                    expanded.append({
-                        "role": "assistant",
-                        "content": {"type": "tool_use", "id": call_id, "name": name, "input": input_data},
-                    })
+                            verbose_proxy_logger.warning(
+                                "Failed to parse tool_call arguments, dropping input"
+                            )
+                    expanded.append(
+                        {
+                            "role": "assistant",
+                            "content": {
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": input_data,
+                            },
+                        }
+                    )
 
         return expanded
 
@@ -625,17 +770,33 @@ class LassoGuardrail(CustomGuardrail):
         if tools_data:
             tool_definitions = []
             for tool in tools_data:
-                func = tool.get("function") if isinstance(tool, dict) else getattr(tool, "function", None)
+                func = (
+                    tool.get("function")
+                    if isinstance(tool, dict)
+                    else getattr(tool, "function", None)
+                )
                 if not func:
                     continue
-                name = func.get("name") if isinstance(func, dict) else getattr(func, "name", None)
+                name = (
+                    func.get("name")
+                    if isinstance(func, dict)
+                    else getattr(func, "name", None)
+                )
                 if not name:
                     continue
                 td: Dict[str, Any] = {"name": name}
-                description = func.get("description") if isinstance(func, dict) else getattr(func, "description", None)
+                description = (
+                    func.get("description")
+                    if isinstance(func, dict)
+                    else getattr(func, "description", None)
+                )
                 if description:
                     td["description"] = description
-                parameters = func.get("parameters") if isinstance(func, dict) else getattr(func, "parameters", None)
+                parameters = (
+                    func.get("parameters")
+                    if isinstance(func, dict)
+                    else getattr(func, "parameters", None)
+                )
                 if parameters:
                     td["parameters"] = parameters
                 tool_definitions.append(td)
@@ -765,22 +926,54 @@ class LassoGuardrail(CustomGuardrail):
     def _apply_masking_to_model_response(
         self,
         model_response: litellm.ModelResponse,
-        masked_messages: List[Dict[str, str]],
+        masked_messages: List[Dict[str, Any]],
     ) -> None:
         """Apply masking to the actual model response when mask=True and masked content is available."""
-        masked_index = 0
+        # Index masked tool_use blocks by id for O(1) lookup.
+        masked_tool_use: Dict[str, Dict[str, Any]] = {}
+        masked_text: List[str] = []
+        for msg in masked_messages:
+            content = msg.get("content")
+            if isinstance(content, dict) and content.get("type") == "tool_use":
+                call_id = content.get("id")
+                if call_id:
+                    masked_tool_use[call_id] = content
+            elif isinstance(content, str):
+                masked_text.append(content)
+
+        text_cursor = 0
         for choice in model_response.choices:
-            if (
-                hasattr(choice, "message")
-                and choice.message.content
-                and masked_index < len(masked_messages)
-            ):
-                # Replace the content with the masked version from Lasso
-                choice.message.content = masked_messages[masked_index]["content"]
-                masked_index += 1
+            if not hasattr(choice, "message"):
+                continue
+            msg = choice.message
+
+            if msg.content and text_cursor < len(masked_text):
+                msg.content = masked_text[text_cursor]
+                text_cursor += 1
                 verbose_proxy_logger.debug(
-                    f"Applied masked content to choice {masked_index}"
+                    f"Applied masked text content to choice {text_cursor}"
                 )
+
+            for call in getattr(msg, "tool_calls", None) or []:
+                call_id = (
+                    call.get("id")
+                    if isinstance(call, dict)
+                    else getattr(call, "id", None)
+                )
+                if call_id and call_id in masked_tool_use:
+                    masked_input = masked_tool_use[call_id].get("input")
+                    if masked_input is not None:
+                        if isinstance(call, dict):
+                            func = call.get("function", {})
+                            if isinstance(func, dict):
+                                func["arguments"] = json.dumps(masked_input)
+                        else:
+                            func = getattr(call, "function", None)
+                            if func:
+                                func.arguments = json.dumps(masked_input)
+                        verbose_proxy_logger.debug(
+                            f"Applied masked tool_call arguments for call_id={call_id}"
+                        )
 
     @staticmethod
     def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
