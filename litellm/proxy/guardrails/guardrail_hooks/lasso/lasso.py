@@ -51,7 +51,10 @@ from litellm.llms.custom_httpx.http_handler import (
     httpxSpecialProvider,
 )
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.guardrails._content_utils import has_non_string_content
+from litellm.proxy.guardrails._content_utils import (
+    build_inspection_messages,
+    has_non_string_content,
+)
 from litellm.types.guardrails import GuardrailEventHooks
 import litellm
 
@@ -415,10 +418,14 @@ class LassoGuardrail(CustomGuardrail):
             LassoGuardrailAPIError: If the Lasso API call fails
             HTTPException: If blocking violations are detected
         """
-        messages: List[Dict[str, Any]] = data.get("messages", [])
-        if not messages:
-            return data
-        messages = self._expand_messages_for_classification(messages)
+        messages: List[Dict[str, Any]] = data.get("messages") or []
+        if messages:
+            messages = self._expand_messages_for_classification(messages)
+        else:
+            # Responses-API payloads carry text in data["input"] with no
+            # "messages" field; lift it into chat-style messages so the
+            # guardrail still inspects the request.
+            messages = build_inspection_messages(data)
         if not messages:
             return data
 
@@ -471,9 +478,10 @@ class LassoGuardrail(CustomGuardrail):
             # downstream provider receives a compatible payload.
             if response.get("violations_detected") and response.get("messages"):
                 masked = response["messages"]
-                data["messages"] = self._map_masked_messages_back(
-                    data["messages"], masked
-                )
+                if data.get("messages"):
+                    data["messages"] = self._map_masked_messages_back(
+                        data["messages"], masked
+                    )
                 # Also update data["input"] for Responses-API payloads so the
                 # unredacted text doesn't leak through that field.
                 if isinstance(data.get("input"), str):
