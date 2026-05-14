@@ -15,6 +15,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     Union,
     TypedDict,
@@ -131,6 +132,39 @@ class LassoGuardrail(CustomGuardrail):
 
         super().__init__(**kwargs)
 
+    @staticmethod
+    def _get_field(obj: Any, field: str, default: Any = None) -> Any:
+        """Get a field from either a dict or a Pydantic object."""
+        if isinstance(obj, dict):
+            return obj.get(field, default)
+        return getattr(obj, field, default)
+
+    @staticmethod
+    def _extract_tool_call_fields(
+        call: Any,
+    ) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+        """Extract (call_id, name, parsed_input) from a tool call.
+
+        Handles both dict-style and Pydantic object-style tool_calls.
+        Parses the JSON arguments string into a dict when possible.
+        """
+        get = LassoGuardrail._get_field
+        call_id = get(call, "id")
+        func = get(call, "function")
+        if not func:
+            return call_id, None, None
+        name = get(func, "name")
+        args_str = get(func, "arguments")
+        input_data: Optional[Dict[str, Any]] = None
+        if args_str:
+            try:
+                parsed = json.loads(args_str)
+                if isinstance(parsed, dict):
+                    input_data = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return call_id, name, input_data
+
     def _generate_ulid(self) -> str:
         """
         Generate a ULID (Universally Unique Lexicographically Sortable Identifier).
@@ -234,38 +268,9 @@ class LassoGuardrail(CustomGuardrail):
                         {"role": "assistant", "content": msg.content}
                     )
                 for call in getattr(msg, "tool_calls", None) or []:
-                    call_id = (
-                        call.get("id")
-                        if isinstance(call, dict)
-                        else getattr(call, "id", None)
-                    )
-                    func = (
-                        call.get("function")
-                        if isinstance(call, dict)
-                        else getattr(call, "function", None)
-                    )
-                    name = (
-                        func.get("name")
-                        if isinstance(func, dict)
-                        else getattr(func, "name", None)
-                    )
-                    args_str = (
-                        func.get("arguments")
-                        if isinstance(func, dict)
-                        else getattr(func, "arguments", None)
-                    )
+                    call_id, name, input_data = self._extract_tool_call_fields(call)
                     if not call_id or not name:
                         continue
-                    input_data = None
-                    if args_str:
-                        try:
-                            parsed = json.loads(args_str)
-                            if isinstance(parsed, dict):
-                                input_data = parsed
-                        except (json.JSONDecodeError, TypeError):
-                            verbose_proxy_logger.debug(
-                                "Failed to parse tool_call arguments as JSON, sending null input"
-                            )
                     response_messages.append(
                         {
                             "role": "model",
@@ -603,9 +608,7 @@ class LassoGuardrail(CustomGuardrail):
         """Replace tool_call arguments with masked values returned by Lasso."""
         updated = []
         for call in tool_calls:
-            call_id = (
-                call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
-            )
+            call_id = self._get_field(call, "id")
             if call_id and call_id in masked_tool_use:
                 masked_input = masked_tool_use[call_id].get("input")
                 if masked_input is not None:
@@ -738,44 +741,13 @@ class LassoGuardrail(CustomGuardrail):
 
             if role == "assistant":
                 for call in msg.get("tool_calls") or []:
-                    call_id = (
-                        call.get("id")
-                        if isinstance(call, dict)
-                        else getattr(call, "id", None)
-                    )
-                    func = (
-                        call.get("function")
-                        if isinstance(call, dict)
-                        else getattr(call, "function", None)
-                    )
-                    if not func:
-                        continue
-                    name = (
-                        func.get("name")
-                        if isinstance(func, dict)
-                        else getattr(func, "name", None)
-                    )
-                    args_str = (
-                        func.get("arguments")
-                        if isinstance(func, dict)
-                        else getattr(func, "arguments", None)
-                    )
+                    call_id, name, input_data = self._extract_tool_call_fields(call)
                     if not call_id or not name:
                         verbose_proxy_logger.warning(
                             "Skipping malformed tool_call",
                             extra={"call_id": call_id, "name": name},
                         )
                         continue
-                    input_data = None
-                    if args_str:
-                        try:
-                            parsed = json.loads(args_str)
-                            if isinstance(parsed, dict):
-                                input_data = parsed
-                        except (json.JSONDecodeError, TypeError):
-                            verbose_proxy_logger.warning(
-                                "Failed to parse tool_call arguments, dropping input"
-                            )
                     expanded.append(
                         {
                             "role": "model",
@@ -843,35 +815,20 @@ class LassoGuardrail(CustomGuardrail):
         # Map OpenAI ChatCompletionToolParam array → ToolDefinition array
         tools_data: List[Dict[str, Any]] = data.get("tools") or []
         if tools_data:
+            get = self._get_field
             tool_definitions = []
             for tool in tools_data:
-                func = (
-                    tool.get("function")
-                    if isinstance(tool, dict)
-                    else getattr(tool, "function", None)
-                )
+                func = get(tool, "function")
                 if not func:
                     continue
-                name = (
-                    func.get("name")
-                    if isinstance(func, dict)
-                    else getattr(func, "name", None)
-                )
+                name = get(func, "name")
                 if not name:
                     continue
                 td: Dict[str, Any] = {"name": name}
-                description = (
-                    func.get("description")
-                    if isinstance(func, dict)
-                    else getattr(func, "description", None)
-                )
+                description = get(func, "description")
                 if description:
                     td["description"] = description
-                parameters = (
-                    func.get("parameters")
-                    if isinstance(func, dict)
-                    else getattr(func, "parameters", None)
-                )
+                parameters = get(func, "parameters")
                 if parameters:
                     td["parameters"] = parameters
                 tool_definitions.append(td)
@@ -1030,11 +987,7 @@ class LassoGuardrail(CustomGuardrail):
                 )
 
             for call in getattr(msg, "tool_calls", None) or []:
-                call_id = (
-                    call.get("id")
-                    if isinstance(call, dict)
-                    else getattr(call, "id", None)
-                )
+                call_id = self._get_field(call, "id")
                 if call_id and call_id in masked_tool_use:
                     masked_input = masked_tool_use[call_id].get("input")
                     if masked_input is not None:
