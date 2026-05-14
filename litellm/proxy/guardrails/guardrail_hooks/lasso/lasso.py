@@ -498,8 +498,8 @@ class LassoGuardrail(CustomGuardrail):
             # Apply masking to messages if violations detected and masked messages are available.
             # Map masked content back onto the original OpenAI-format messages so the
             # downstream provider receives a compatible payload.
-            if response.get("violations_detected") and response.get("messages"):
-                masked = response["messages"]
+            masked = response.get("messages")
+            if response.get("violations_detected") and masked:
                 masked_for_messages = masked[:messages_count]
                 masked_for_input = masked[messages_count:]
                 if data.get("messages"):
@@ -634,13 +634,13 @@ class LassoGuardrail(CustomGuardrail):
                 if masked_input is not None:
                     if isinstance(call, dict):
                         call = dict(call)
-                        func = dict(call.get("function", {}))
-                        func["arguments"] = json.dumps(masked_input)
-                        call["function"] = func
+                        func_dict = dict(call.get("function", {}))
+                        func_dict["arguments"] = json.dumps(masked_input)
+                        call["function"] = func_dict
                     else:
-                        func = getattr(call, "function", None)
-                        if func:
-                            func.arguments = json.dumps(masked_input)
+                        func_obj = getattr(call, "function", None)
+                        if func_obj:
+                            func_obj.arguments = json.dumps(masked_input)
             updated.append(call)
         return updated
 
@@ -991,8 +991,8 @@ class LassoGuardrail(CustomGuardrail):
         # Index masked tool_use blocks by id for O(1) lookup.
         masked_tool_use: Dict[str, Dict[str, Any]] = {}
         masked_text: List[str] = []
-        for msg in masked_messages:
-            content = msg.get("content")
+        for masked_msg in masked_messages:
+            content = masked_msg.get("content")
             if isinstance(content, dict) and content.get("type") == "tool_use":
                 call_id = content.get("id")
                 if call_id:
