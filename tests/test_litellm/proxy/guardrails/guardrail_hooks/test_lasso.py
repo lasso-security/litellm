@@ -832,7 +832,7 @@ class TestLassoGuardrail:
         assert len(expanded) == 2
         assert expanded[0] == {"role": "user", "content": "What's the weather in NY?"}
         assert expanded[1] == {
-            "role": "assistant",
+            "role": "model",
             "content": {"type": "tool_use", "id": "call_abc", "name": "get_weather", "input": {"city": "NY"}},
         }
 
@@ -969,3 +969,66 @@ class TestLassoGuardrail:
             )
 
         assert result == mock_model_response
+
+    # ------------------------------------------------------------------
+    # _map_masked_messages_back round-trip tests
+    # ------------------------------------------------------------------
+
+    def test_map_masked_messages_back_text(self):
+        """Plain text content is replaced with masked version."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        original = [{"role": "user", "content": "My email is john@example.com"}]
+        masked = [{"role": "user", "content": "My email is <EMAIL>"}]
+        result = guardrail._map_masked_messages_back(original, masked)
+        assert result == [{"role": "user", "content": "My email is <EMAIL>"}]
+
+    def test_map_masked_messages_back_tool_result(self):
+        """Tool result content is replaced with masked version."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        original = [{"role": "tool", "tool_call_id": "call_abc", "content": "secret: abc123"}]
+        masked = [
+            {
+                "role": "developer",
+                "content": {"type": "tool_result", "tool_use_id": "call_abc", "content": "secret: <REDACTED>"},
+            }
+        ]
+        result = guardrail._map_masked_messages_back(original, masked)
+        assert result[0]["content"] == "secret: <REDACTED>"
+
+    def test_map_masked_messages_back_tool_use_arguments(self):
+        """Assistant tool_call arguments are replaced with masked values."""
+        import json as _json
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        original = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "send_email", "arguments": '{"to":"john@example.com"}'}}
+                ],
+            }
+        ]
+        masked = [
+            {
+                "role": "model",
+                "content": {"type": "tool_use", "id": "call_1", "name": "send_email", "input": {"to": "<EMAIL>"}},
+            }
+        ]
+        result = guardrail._map_masked_messages_back(original, masked)
+        updated_args = _json.loads(result[0]["tool_calls"][0]["function"]["arguments"])
+        assert updated_args == {"to": "<EMAIL>"}
+
+    def test_map_masked_messages_back_preserves_unmasked(self):
+        """Messages without sensitive content pass through unchanged."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        original = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "My ssn is 123-45-6789"},
+        ]
+        masked = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "My ssn is <SSN>"},
+        ]
+        result = guardrail._map_masked_messages_back(original, masked)
+        assert result[0]["content"] == "You are helpful."
+        assert result[1]["content"] == "My ssn is <SSN>"
