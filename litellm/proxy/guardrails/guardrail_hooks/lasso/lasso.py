@@ -269,7 +269,7 @@ class LassoGuardrail(CustomGuardrail):
                             )
                     response_messages.append(
                         {
-                            "role": "assistant",
+                            "role": "model",
                             "content": {
                                 "type": "tool_use",
                                 "id": call_id,
@@ -708,7 +708,7 @@ class LassoGuardrail(CustomGuardrail):
                             )
                     expanded.append(
                         {
-                            "role": "assistant",
+                            "role": "model",
                             "content": {
                                 "type": "tool_use",
                                 "id": call_id,
