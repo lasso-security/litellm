@@ -1150,6 +1150,44 @@ class TestLassoGuardrail:
         # Subsequent message still correctly mapped (cursor aligned)
         assert result[1]["content"] == "Got it."
 
+    def test_apply_masking_to_model_response_multiple_choices(self):
+        """Post-call masking applies correct masked text to each choice."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        mock_response = MagicMock(spec=litellm.ModelResponse)
+        choice_a = MagicMock()
+        choice_a.message.content = "Email: alice@example.com"
+        choice_a.message.tool_calls = None
+        choice_b = MagicMock()
+        choice_b.message.content = "Email: bob@example.com"
+        choice_b.message.tool_calls = None
+        mock_response.choices = [choice_a, choice_b]
+
+        masked_messages = [
+            {"role": "assistant", "content": "Email: <EMAIL_1>"},
+            {"role": "assistant", "content": "Email: <EMAIL_2>"},
+        ]
+        guardrail._apply_masking_to_model_response(mock_response, masked_messages)
+        assert choice_a.message.content == "Email: <EMAIL_1>"
+        assert choice_b.message.content == "Email: <EMAIL_2>"
+
+    def test_apply_masking_to_model_response_count_mismatch(self):
+        """Text remap skipped when masked text count doesn't match choices."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        mock_response = MagicMock(spec=litellm.ModelResponse)
+        choice = MagicMock()
+        choice.message.content = "Original PII text"
+        choice.message.tool_calls = None
+        mock_response.choices = [choice]
+
+        # Lasso returns 2 texts but model only had 1 choice — mismatch
+        masked_messages = [
+            {"role": "assistant", "content": "Masked A"},
+            {"role": "assistant", "content": "Masked B"},
+        ]
+        guardrail._apply_masking_to_model_response(mock_response, masked_messages)
+        # Content should remain unchanged due to count guard
+        assert choice.message.content == "Original PII text"
+
     def test_map_masked_messages_back_preserves_unmasked(self):
         """Messages without sensitive content pass through unchanged."""
         guardrail = LassoGuardrail(lasso_api_key="test-api-key")

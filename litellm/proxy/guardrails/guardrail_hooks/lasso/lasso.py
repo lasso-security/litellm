@@ -973,13 +973,29 @@ class LassoGuardrail(CustomGuardrail):
             elif isinstance(content, str):
                 masked_text.append(content)
 
+        # Count text-bearing choices to verify 1:1 mapping with masked texts.
+        original_text_count = sum(
+            1
+            for c in model_response.choices
+            if hasattr(c, "message") and c.message.content
+        )
+        apply_text = original_text_count == len(masked_text)
+        if not apply_text and masked_text:
+            verbose_proxy_logger.warning(
+                "Lasso masked-text count mismatch in model response; skipping text remap",
+                extra={
+                    "original_text_count": original_text_count,
+                    "masked_text_count": len(masked_text),
+                },
+            )
+
         text_cursor = 0
         for choice in model_response.choices:
             if not hasattr(choice, "message"):
                 continue
             msg = choice.message
 
-            if msg.content and text_cursor < len(masked_text):
+            if msg.content and apply_text and text_cursor < len(masked_text):
                 msg.content = masked_text[text_cursor]
                 text_cursor += 1
                 verbose_proxy_logger.debug(
