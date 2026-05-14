@@ -51,11 +51,7 @@ from litellm.llms.custom_httpx.http_handler import (
     httpxSpecialProvider,
 )
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.guardrails._content_utils import (
-    apply_redacted_messages_back,
-    build_inspection_messages,
-    has_non_string_content,
-)
+from litellm.proxy.guardrails._content_utils import has_non_string_content
 from litellm.types.guardrails import GuardrailEventHooks
 import litellm
 
@@ -474,9 +470,19 @@ class LassoGuardrail(CustomGuardrail):
             # Map masked content back onto the original OpenAI-format messages so the
             # downstream provider receives a compatible payload.
             if response.get("violations_detected") and response.get("messages"):
+                masked = response["messages"]
                 data["messages"] = self._map_masked_messages_back(
-                    data["messages"], response["messages"]
+                    data["messages"], masked
                 )
+                # Also update data["input"] for Responses-API payloads so the
+                # unredacted text doesn't leak through that field.
+                if isinstance(data.get("input"), str):
+                    text_parts = [
+                        msg["content"]
+                        for msg in masked
+                        if isinstance(msg.get("content"), str)
+                    ]
+                    data["input"] = "\n".join(text_parts)
                 self._log_masking_applied(message_type, dict(response))
 
             return data
@@ -663,7 +669,16 @@ class LassoGuardrail(CustomGuardrail):
                 )
                 continue
 
-            if content:
+            if isinstance(content, list):
+                # Flatten multimodal content arrays to plain text for Lasso.
+                text_parts = [
+                    part["text"]
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+                ]
+                if text_parts:
+                    expanded.append({"role": role, "content": "\n".join(text_parts)})
+            elif content:
                 expanded.append({"role": role, "content": content})
 
             if role == "assistant":
