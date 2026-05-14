@@ -1127,6 +1127,29 @@ class TestLassoGuardrail:
         updated_args = _json.loads(result[0]["tool_calls"][0]["function"]["arguments"])
         assert updated_args == {"to": "<EMAIL>"}
 
+    def test_map_masked_messages_back_list_content(self):
+        """Multimodal list content is replaced with masked text string."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        original = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "My email is john@example.com"},
+                    {"type": "image_url", "image_url": {"url": "https://img.png"}},
+                ],
+            },
+            {"role": "assistant", "content": "Got it."},
+        ]
+        masked = [
+            {"role": "user", "content": "My email is <EMAIL>"},
+            {"role": "assistant", "content": "Got it."},
+        ]
+        result = guardrail._map_masked_messages_back(original, masked)
+        # List content replaced with masked text string
+        assert result[0]["content"] == "My email is <EMAIL>"
+        # Subsequent message still correctly mapped (cursor aligned)
+        assert result[1]["content"] == "Got it."
+
     def test_map_masked_messages_back_preserves_unmasked(self):
         """Messages without sensitive content pass through unchanged."""
         guardrail = LassoGuardrail(lasso_api_key="test-api-key")

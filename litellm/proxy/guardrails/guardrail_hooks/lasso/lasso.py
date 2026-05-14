@@ -574,6 +574,18 @@ class LassoGuardrail(CustomGuardrail):
                         orig_msg["tool_calls"], masked_tool_use
                     )
 
+            elif isinstance(content, list):
+                # Multimodal list content was flattened to a text string before
+                # being sent to Lasso.  Replace the list with the masked text
+                # so the cursor stays aligned with subsequent messages.
+                if apply_text_cursor and text_cursor < len(masked_text):
+                    msg["content"] = masked_text[text_cursor]
+                    text_cursor += 1
+                if role == "assistant" and orig_msg.get("tool_calls"):
+                    msg["tool_calls"] = self._update_tool_calls_from_masked(
+                        orig_msg["tool_calls"], masked_tool_use
+                    )
+
             elif role == "assistant" and not content and orig_msg.get("tool_calls"):
                 msg["tool_calls"] = self._update_tool_calls_from_masked(
                     orig_msg["tool_calls"], masked_tool_use
