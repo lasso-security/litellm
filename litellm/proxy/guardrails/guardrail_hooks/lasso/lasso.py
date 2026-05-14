@@ -159,10 +159,15 @@ class LassoGuardrail(CustomGuardrail):
         if args_str:
             try:
                 parsed = json.loads(args_str)
-                if isinstance(parsed, dict):
-                    input_data = parsed
             except (json.JSONDecodeError, TypeError):
-                pass
+                parsed = None
+            if isinstance(parsed, dict):
+                input_data = parsed
+            else:
+                # Preserve the raw argument string so Lasso still inspects
+                # callers that smuggle PII/blocked content as malformed JSON
+                # or non-object payloads.
+                input_data = {"arguments": args_str}
         return call_id, name, input_data
 
     def _generate_ulid(self) -> str:
@@ -423,14 +428,16 @@ class LassoGuardrail(CustomGuardrail):
             LassoGuardrailAPIError: If the Lasso API call fails
             HTTPException: If blocking violations are detected
         """
-        messages: List[Dict[str, Any]] = data.get("messages") or []
-        if messages:
-            messages = self._expand_messages_for_classification(messages)
-        else:
-            # Responses-API payloads carry text in data["input"] with no
-            # "messages" field; lift it into chat-style messages so the
-            # guardrail still inspects the request.
-            messages = build_inspection_messages(data)
+        raw_messages: List[Dict[str, Any]] = data.get("messages") or []
+        messages: List[Dict[str, Any]] = (
+            self._expand_messages_for_classification(raw_messages) if raw_messages else []
+        )
+        messages_count = len(messages)
+        if data.get("input") is not None:
+            # Responses-API payloads carry text in data["input"]. Inspect it
+            # alongside any "messages" array — otherwise a caller can attach
+            # benign messages and stash blocked content in input to bypass.
+            messages.extend(build_inspection_messages({"input": data["input"]}))
         if not messages:
             return data
 
@@ -440,7 +447,9 @@ class LassoGuardrail(CustomGuardrail):
         # classify endpoint (which still raises on BLOCK actions) and
         # leave the original payload intact.
         if self.mask and not has_non_string_content(data):
-            return await self._handle_masking(data, cache, message_type, messages)
+            return await self._handle_masking(
+                data, cache, message_type, messages, messages_count
+            )
         return await self._handle_classification(data, cache, message_type, messages)
 
     async def _handle_classification(
@@ -467,8 +476,14 @@ class LassoGuardrail(CustomGuardrail):
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"],
         messages: List[Dict[str, Any]],
+        messages_count: int,
     ) -> dict:
-        """Handle masking with classifix endpoint."""
+        """Handle masking with classifix endpoint.
+
+        ``messages_count`` is the number of inspected items derived from
+        ``data["messages"]``; any items beyond that index came from
+        ``data["input"]`` and must be written back there, not into messages.
+        """
         try:
             headers = self._prepare_headers(data, cache)
             payload = self._prepare_payload(messages, data, cache, message_type)
@@ -483,19 +498,22 @@ class LassoGuardrail(CustomGuardrail):
             # downstream provider receives a compatible payload.
             if response.get("violations_detected") and response.get("messages"):
                 masked = response["messages"]
+                masked_for_messages = masked[:messages_count]
+                masked_for_input = masked[messages_count:]
                 if data.get("messages"):
                     data["messages"] = self._map_masked_messages_back(
-                        data["messages"], masked
+                        data["messages"], masked_for_messages
                     )
                 # Also update data["input"] for Responses-API payloads so the
                 # unredacted text doesn't leak through that field.
                 if isinstance(data.get("input"), str):
                     text_parts = [
                         msg["content"]
-                        for msg in masked
+                        for msg in masked_for_input
                         if isinstance(msg.get("content"), str)
                     ]
-                    data["input"] = "\n".join(text_parts)
+                    if text_parts:
+                        data["input"] = "\n".join(text_parts)
                 self._log_masking_applied(message_type, dict(response))
 
             return data
