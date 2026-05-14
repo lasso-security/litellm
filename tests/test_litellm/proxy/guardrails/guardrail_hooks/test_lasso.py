@@ -767,3 +767,205 @@ class TestLassoGuardrail:
         empty_response = {}
         blocking_violations = guardrail._check_for_blocking_actions(empty_response)
         assert len(blocking_violations) == 0
+
+    # ------------------------------------------------------------------
+    # Tool-calling tests
+    # ------------------------------------------------------------------
+
+    def test_payload_preparation_with_tools(self):
+        """_prepare_payload maps OpenAI ChatCompletionToolParam to ToolDefinition shape."""
+        guardrail = LassoGuardrail(
+            lasso_api_key="test-api-key",
+            conversation_id="test-conversation",
+        )
+        data = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    },
+                }
+            ]
+        }
+        payload = guardrail._prepare_payload([], data, DualCache(), "PROMPT")
+        assert "tools" in payload
+        assert payload["tools"] == [
+            {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }
+        ]
+
+    def test_payload_preparation_no_tools(self):
+        """_prepare_payload omits tools key when no tools provided (regression)."""
+        guardrail = LassoGuardrail(
+            lasso_api_key="test-api-key",
+            conversation_id="test-conversation",
+        )
+        messages = [{"role": "user", "content": "Hello"}]
+        payload = guardrail._prepare_payload(messages, {}, DualCache(), "PROMPT")
+        assert "tools" not in payload
+        assert payload["messages"] == messages
+
+    def test_expand_messages_assistant_tool_calls(self):
+        """Pre-call: assistant tool_calls expand into tool_use content blocks."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [
+            {"role": "user", "content": "What's the weather in NY?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"NY"}'},
+                    }
+                ],
+            },
+        ]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert len(expanded) == 2
+        assert expanded[0] == {"role": "user", "content": "What's the weather in NY?"}
+        assert expanded[1] == {
+            "role": "assistant",
+            "content": {"type": "tool_use", "id": "call_abc", "name": "get_weather", "input": {"city": "NY"}},
+        }
+
+    def test_expand_messages_tool_role(self):
+        """Pre-call: role=tool messages become developer + tool_result block."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [
+            {"role": "tool", "tool_call_id": "call_abc", "content": "72°F, sunny"},
+        ]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert len(expanded) == 1
+        assert expanded[0] == {
+            "role": "developer",
+            "content": {"type": "tool_result", "tool_use_id": "call_abc", "content": "72°F, sunny"},
+        }
+
+    def test_expand_messages_tool_role_missing_tool_call_id(self):
+        """Pre-call: tool message without tool_call_id is skipped with a warning."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [{"role": "tool", "content": "some result"}]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert expanded == []
+
+    def test_expand_messages_assistant_with_text_and_tool_calls(self):
+        """Pre-call: assistant with both text and tool_calls produces text msg + tool_use msg."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Let me check that for you.",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                ],
+            }
+        ]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert len(expanded) == 2
+        assert expanded[0] == {"role": "assistant", "content": "Let me check that for you."}
+        assert expanded[1]["content"]["type"] == "tool_use"
+        assert expanded[1]["content"]["name"] == "lookup"
+
+    def test_expand_messages_plain_text_unchanged(self):
+        """Pre-call: plain text messages pass through without modification (regression)."""
+        guardrail = LassoGuardrail(lasso_api_key="test-api-key")
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+        expanded = guardrail._expand_messages_for_classification(messages)
+        assert expanded == messages
+
+    @pytest.mark.asyncio
+    async def test_post_call_with_tool_calls(self):
+        """Post-call: tool_calls in model response are extracted as tool_use blocks."""
+        guardrail = LassoGuardrail(
+            lasso_api_key="test-api-key",
+            guardrail_name="test-guard",
+            event_hook="post_call",
+            default_on=True,
+        )
+        data = {"messages": [{"role": "user", "content": "run the tool"}]}
+
+        mock_model_response = MagicMock(spec=litellm.ModelResponse)
+        mock_choice = MagicMock()
+        mock_choice.message.content = None
+        tool_call = MagicMock()
+        tool_call.id = "call_xyz"
+        tool_call.function.name = "my_tool"
+        tool_call.function.arguments = '{"param": "value"}'
+        mock_choice.message.tool_calls = [tool_call]
+        mock_model_response.choices = [mock_choice]
+
+        captured_payload = {}
+
+        async def capture_post(url, headers, json, timeout):
+            captured_payload.update(json)
+            return Response(
+                status_code=200,
+                json={"deputies": {}, "findings": {}, "violations_detected": False},
+                request=Request(method="POST", url=url),
+            )
+
+        with patch(
+            "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+            side_effect=capture_post,
+        ):
+            result = await guardrail.async_post_call_success_hook(
+                data=data,
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=mock_model_response,
+            )
+
+        assert result == mock_model_response
+        assert len(captured_payload["messages"]) == 1
+        assert captured_payload["messages"][0]["content"] == {
+            "type": "tool_use",
+            "id": "call_xyz",
+            "name": "my_tool",
+            "input": {"param": "value"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_post_call_text_only_regression(self):
+        """Post-call: text-only response still classified correctly (regression)."""
+        guardrail = LassoGuardrail(
+            lasso_api_key="test-api-key",
+            guardrail_name="test-guard",
+            event_hook="post_call",
+            default_on=True,
+        )
+        data = {"messages": [{"role": "user", "content": "Hello"}]}
+
+        mock_model_response = MagicMock(spec=litellm.ModelResponse)
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Hi! How can I help?"
+        mock_choice.message.tool_calls = None
+        mock_model_response.choices = [mock_choice]
+
+        mock_api_response = Response(
+            status_code=200,
+            json={"deputies": {}, "findings": {}, "violations_detected": False},
+            request=Request(method="POST", url="https://server.lasso.security/gateway/v3/classify"),
+        )
+
+        with patch(
+            "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+            return_value=mock_api_response,
+        ):
+            result = await guardrail.async_post_call_success_hook(
+                data=data,
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=mock_model_response,
+            )
+
+        assert result == mock_model_response
