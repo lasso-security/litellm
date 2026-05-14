@@ -530,6 +530,28 @@ class LassoGuardrail(CustomGuardrail):
             elif isinstance(content, str):
                 masked_text.append(content)
 
+        # Positional cursor only works if Lasso echoes every text message back.
+        # Skip text remap on count mismatch to avoid writing masked content
+        # onto the wrong original message.
+        original_text_count = sum(
+            1
+            for m in original_messages
+            if m.get("role") != "tool"
+            and (
+                (isinstance(m.get("content"), str) and m.get("content"))
+                or isinstance(m.get("content"), list)
+            )
+        )
+        apply_text_cursor = original_text_count == len(masked_text)
+        if not apply_text_cursor and masked_text:
+            verbose_proxy_logger.warning(
+                "Lasso masked-text count mismatch; skipping text remap",
+                extra={
+                    "original_text_count": original_text_count,
+                    "masked_text_count": len(masked_text),
+                },
+            )
+
         result: List[Dict[str, Any]] = []
         text_cursor = 0
 
@@ -544,7 +566,7 @@ class LassoGuardrail(CustomGuardrail):
                     msg["content"] = masked_tool_result[tool_call_id]
 
             elif isinstance(content, str) and content:
-                if text_cursor < len(masked_text):
+                if apply_text_cursor and text_cursor < len(masked_text):
                     msg["content"] = masked_text[text_cursor]
                     text_cursor += 1
                 if role == "assistant" and orig_msg.get("tool_calls"):
