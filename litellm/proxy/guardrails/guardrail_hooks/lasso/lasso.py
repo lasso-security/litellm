@@ -60,6 +60,85 @@ from litellm.types.guardrails import GuardrailEventHooks
 import litellm
 
 
+# ── Intent double-duty ───────────────────────────────────────────────────────
+# When an app funnels its LLM calls through LiteLLM and seeds per-turn intent headers
+# (via the lasso-sdk GatewayIntent primitive), the plugin's existing /classify call
+# double-duties as intent ingestion: it stamps the classify payload's messages with a
+# per-turn traceId, a deterministic eventId, and a stride-spaced eventIndex, so Lasso's
+# server derives the intent signal from role x content-kind and dedups re-sent history on
+# eventId. Inert when no x-lasso-trace-id is present (a plain guardrail call), so the vertical
+# ships dark until the app starts seeding. Mirrors the Kong ai-lasso-guardrail plugin (the
+# reference intent implementation) and the server-side LiteLLM generic-guardrail shim.
+_INTENT_TRACE_ID_HEADER = "x-lasso-trace-id"
+_INTENT_SESSION_ID_HEADER = "x-session-id"
+_INTENT_APP_INTENT_HEADER = "x-lasso-application-intent"
+_INTENT_APP_NAME_HEADER = "x-lasso-application-name"
+_INTENT_ENCODING_HEADER = "x-lasso-encoding"
+# A header not on LiteLLM's forward-allowlist arrives as this placeholder, not a value.
+_HEADER_PRESENT_PLACEHOLDER = "[present]"
+
+# Reproducible events (text / tool_use / tool_result) are indexed on a stride so COMPLETION-only,
+# non-reproducible events (reasoning) can slot strictly between them. A reproducible event at
+# sequence position p gets eventIndex p*STRIDE; a reasoning event that precedes it fills just above
+# the previous reproducible event — strictly after it, strictly before the next, and off the stride
+# grid so its derived eventId can't collide with a reproducible one.
+_EVENT_INDEX_STRIDE = 10
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _derive_event_id(trace_id: str, event_index: int) -> str:
+    """Deterministic ULID-shaped event id, stable for a (trace_id, event_index) pair and unique
+    within the trace, so the server's eventId-keyed dedup collapses the history re-sent every turn.
+    Keeps the 26-char Crockford shape (passes the server's ULID validation): the trace_id's high 20
+    chars + 6 chars of base32 index (32^6 ~= 1e9 events per trace)."""
+    prefix = (trace_id or "")[:20]
+    if len(prefix) < 20:
+        prefix = prefix + "0" * (20 - len(prefix))
+    n = int(event_index) if event_index else 0
+    suffix = [""] * 6
+    for i in range(5, -1, -1):
+        suffix[i] = _CROCKFORD[n % 32]
+        n //= 32
+    return prefix + "".join(suffix)
+
+
+def _stamp_intent_messages(
+    messages: List[Dict[str, Any]], trace_id: str, start_index: int
+) -> int:
+    """Stamp classify messages in place with intent ids (traceId + stride eventIndex + deterministic
+    eventId). ``start_index`` offsets the (0-based) sequence position so the response phase's
+    COMPLETION events continue after the request phase's PROMPT events. Reasoning blocks are
+    COMPLETION-only and never re-sent in history, so they take a non-reproducible gap index rather
+    than a reproducible slot; a reasoning block with no valid slot (the trace's first event) is
+    dropped — it's intent-only pass-through, so losing it costs the guardrail nothing. Returns the
+    count of reproducible events (the offset the next phase continues from). Mirrors the Kong
+    plugin's ``to_intent_messages``."""
+    base = int(start_index) if start_index else 0
+    repro = 0
+    # Reasoning events since the last reproducible one, so several in a row get distinct gap indices.
+    gap = 0
+    kept: List[Dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        is_reasoning = isinstance(content, dict) and content.get("type") == "reasoning"
+        if is_reasoning:
+            index = (base + repro - 1) * _EVENT_INDEX_STRIDE + 1 + gap
+            # Only negative if reasoning is the trace's very first event — no valid slot before 0.
+            if index < 0:
+                continue
+            gap += 1
+        else:
+            index = (base + repro) * _EVENT_INDEX_STRIDE
+            repro += 1
+            gap = 0
+        msg["traceId"] = trace_id
+        msg["eventIndex"] = index
+        msg["eventId"] = _derive_event_id(trace_id, index)
+        kept.append(msg)
+    messages[:] = kept
+    return repro
+
+
 class LassoResponse(TypedDict):
     """Type definition for Lasso API response."""
 
@@ -182,6 +261,99 @@ class LassoGuardrail(CustomGuardrail):
             verbose_proxy_logger.debug("ULID library not available, using UUID")
             return str(uuid.uuid4())
 
+    @staticmethod
+    def _extract_request_headers(data: dict) -> Dict[str, Any]:
+        """Pull the original proxy request's inbound headers from the request data."""
+        if not isinstance(data, dict):
+            return {}
+        proxy_server_request = data.get("proxy_server_request") or {}
+        headers = (
+            proxy_server_request.get("headers")
+            if isinstance(proxy_server_request, dict)
+            else None
+        )
+        if headers:
+            return headers
+        metadata = data.get("metadata") or {}
+        return (metadata.get("headers") if isinstance(metadata, dict) else None) or {}
+
+    @staticmethod
+    def _get_header(headers: Any, name: str) -> Optional[str]:
+        """Case-insensitive header lookup (HTTP headers are case-insensitive)."""
+        if not isinstance(headers, dict):
+            return None
+        target = name.lower()
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == target:
+                return value
+        return None
+
+    @staticmethod
+    def _decode_header_value(value: str, pct_encoded: bool) -> str:
+        """Percent-decode a seeded value when the SDK flagged non-ASCII with x-lasso-encoding: pct."""
+        if not pct_encoded:
+            return value
+        try:
+            from urllib.parse import unquote
+
+            return unquote(value)
+        except Exception:
+            return value
+
+    def _intent_context(self, data: dict) -> Optional[Dict[str, Any]]:
+        """Parse app-seeded intent headers from the proxy request. Returns None when no per-turn
+        x-lasso-trace-id is present (or it's the non-allowlisted "[present]" placeholder), leaving
+        the call a plain content-safety classify."""
+        headers = self._extract_request_headers(data)
+        trace_id = self._get_header(headers, _INTENT_TRACE_ID_HEADER)
+        if not trace_id or trace_id == _HEADER_PRESENT_PLACEHOLDER:
+            return None
+
+        pct_encoded = self._get_header(headers, _INTENT_ENCODING_HEADER) == "pct"
+        session_id = self._get_header(headers, _INTENT_SESSION_ID_HEADER)
+        app_intent = self._get_header(headers, _INTENT_APP_INTENT_HEADER)
+        app_name = self._get_header(headers, _INTENT_APP_NAME_HEADER)
+
+        session_information: Optional[Dict[str, str]] = None
+        if app_intent:
+            session_information = {
+                "applicationIntent": self._decode_header_value(app_intent, pct_encoded)
+            }
+            if app_name:
+                session_information["agenticAppName"] = self._decode_header_value(
+                    app_name, pct_encoded
+                )
+
+        return {
+            "trace_id": trace_id,
+            "session_id": session_id
+            if session_id and session_id != _HEADER_PRESENT_PLACEHOLDER
+            else None,
+            "session_information": session_information,
+        }
+
+    @staticmethod
+    def _reasoning_text(message: Any) -> Optional[str]:
+        """Extract the model's reasoning text from a completion message, if the provider echoed it.
+        OpenAI-compatible proxies surface extended thinking as ``reasoning_content`` (a string)
+        and/or ``thinking_blocks`` ({type: thinking, thinking: ...}); prefer the string, else join
+        the blocks. Returns None when the message carries no reasoning (thinking off — the common
+        case), so full reasoning coverage is a property of the caller's config, not this plugin."""
+        get = LassoGuardrail._get_field
+        reasoning_content = get(message, "reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            return reasoning_content
+        thinking_blocks = get(message, "thinking_blocks")
+        if isinstance(thinking_blocks, list):
+            parts = [
+                block.get("thinking")
+                for block in thinking_blocks
+                if isinstance(block, dict) and isinstance(block.get("thinking"), str) and block.get("thinking")
+            ]
+            if parts:
+                return "".join(parts)
+        return None
+
     @log_guardrail_information
     async def async_pre_call_hook(
         self,
@@ -214,7 +386,9 @@ class LassoGuardrail(CustomGuardrail):
         # The conversation_id is being stored in the cache so it can be used by the post_call hook
         self._get_or_generate_conversation_id(data, global_cache)
 
-        return await self._run_lasso_guardrail(data, global_cache, message_type="PROMPT")
+        return await self._run_lasso_guardrail(
+            data, global_cache, message_type="PROMPT", intent_ctx=self._intent_context(data)
+        )
 
     @log_guardrail_information
     async def async_moderation_hook(
@@ -242,7 +416,9 @@ class LassoGuardrail(CustomGuardrail):
         if self.should_run_guardrail(data=data, event_type=event_type) is not True:
             return data
 
-        return await self._run_lasso_guardrail(data, cache, message_type="PROMPT")
+        return await self._run_lasso_guardrail(
+            data, cache, message_type="PROMPT", intent_ctx=self._intent_context(data)
+        )
 
     @log_guardrail_information
     async def async_post_call_success_hook(
@@ -260,6 +436,10 @@ class LassoGuardrail(CustomGuardrail):
         if self.should_run_guardrail(data=data, event_type=event_type) is not True:
             return response
 
+        # Intent context comes from the ORIGINAL request headers (data), not the synthetic
+        # response_data below — so reasoning harvesting and id stamping are gated on it.
+        intent_ctx = self._intent_context(data)
+
         # Extract messages from the response for validation
         if isinstance(response, litellm.ModelResponse):
             response_messages: List[Dict[str, Any]] = []
@@ -267,6 +447,15 @@ class LassoGuardrail(CustomGuardrail):
                 if not hasattr(choice, "message"):
                     continue
                 msg = choice.message
+                # Chronological order within the model turn: reasoning first (REASONING_TEXT), then
+                # the answer text (MODEL_RESPONSE), then any tool calls. Reasoning is intent-only
+                # (a non-classified pass-through block), so it's harvested only when intent is active.
+                if intent_ctx:
+                    reasoning = self._reasoning_text(msg)
+                    if reasoning:
+                        response_messages.append(
+                            {"role": "model", "content": {"type": "reasoning", "content": reasoning}}
+                        )
                 if msg.content:
                     response_messages.append({"role": "assistant", "content": msg.content})
                 for call in getattr(msg, "tool_calls", None) or []:
@@ -295,7 +484,9 @@ class LassoGuardrail(CustomGuardrail):
                 # Handle masking for post-call
                 if self.mask:
                     headers = self._prepare_headers(response_data, global_cache)
-                    payload = self._prepare_payload(response_messages, response_data, global_cache, "COMPLETION")
+                    payload = self._prepare_payload(
+                        response_messages, response_data, global_cache, "COMPLETION", intent_ctx
+                    )
                     api_url = f"{self.api_base}/classifix"
 
                     try:
@@ -314,7 +505,9 @@ class LassoGuardrail(CustomGuardrail):
                         raise LassoGuardrailAPIError(f"Failed to apply post-call masking: {str(e)}")
                 else:
                     # Use the same data for conversation_id consistency (no cache access needed)
-                    await self._run_lasso_guardrail(response_data, cache=global_cache, message_type="COMPLETION")
+                    await self._run_lasso_guardrail(
+                        response_data, cache=global_cache, message_type="COMPLETION", intent_ctx=intent_ctx
+                    )
                     verbose_proxy_logger.debug("Post-call Lasso validation completed")
             else:
                 verbose_proxy_logger.warning("No response messages found to validate")
@@ -381,6 +574,7 @@ class LassoGuardrail(CustomGuardrail):
         data: dict,
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"] = "PROMPT",
+        intent_ctx: Optional[Dict[str, Any]] = None,
     ):
         """
         Run the Lasso guardrail with the specified message type.
@@ -423,8 +617,8 @@ class LassoGuardrail(CustomGuardrail):
         # classify endpoint (which still raises on BLOCK actions) and
         # leave the original payload intact.
         if self.mask and not has_non_string_content(data):
-            return await self._handle_masking(data, cache, message_type, messages, messages_count)
-        return await self._handle_classification(data, cache, message_type, messages)
+            return await self._handle_masking(data, cache, message_type, messages, messages_count, intent_ctx)
+        return await self._handle_classification(data, cache, message_type, messages, intent_ctx)
 
     async def _handle_classification(
         self,
@@ -432,11 +626,12 @@ class LassoGuardrail(CustomGuardrail):
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"],
         messages: List[Dict[str, Any]],
+        intent_ctx: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Handle classification without masking."""
         try:
             headers = self._prepare_headers(data, cache)
-            payload = self._prepare_payload(messages, data, cache, message_type)
+            payload = self._prepare_payload(messages, data, cache, message_type, intent_ctx)
             response = await self._call_lasso_api(headers=headers, payload=payload)
             self._process_lasso_response(response)
             return data
@@ -451,6 +646,7 @@ class LassoGuardrail(CustomGuardrail):
         message_type: Literal["PROMPT", "COMPLETION"],
         messages: List[Dict[str, Any]],
         messages_count: int,
+        intent_ctx: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Handle masking with classifix endpoint.
 
@@ -460,7 +656,7 @@ class LassoGuardrail(CustomGuardrail):
         """
         try:
             headers = self._prepare_headers(data, cache)
-            payload = self._prepare_payload(messages, data, cache, message_type)
+            payload = self._prepare_payload(messages, data, cache, message_type, intent_ctx)
             api_url = f"{self.api_base}/classifix"
             response = await self._call_lasso_api(headers=headers, payload=payload, api_url=api_url)
             self._process_lasso_response(response)
@@ -762,6 +958,7 @@ class LassoGuardrail(CustomGuardrail):
         data: dict,
         cache: DualCache,
         message_type: Literal["PROMPT", "COMPLETION"] = "PROMPT",
+        intent_ctx: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Prepare the payload for the Lasso API request.
@@ -771,6 +968,8 @@ class LassoGuardrail(CustomGuardrail):
             message_type: Type of message - "PROMPT" for input, "COMPLETION" for output
             data: Request data (used for conversation_id generation and tools extraction)
             cache: Cache instance for storing conversation_id (optional for post-call)
+            intent_ctx: Parsed intent headers (see _intent_context); when present the payload
+                also carries per-turn intent ids so the same /classify call feeds intent.
         """
         payload: Dict[str, Any] = {"messages": messages, "messageType": message_type}
 
@@ -781,6 +980,9 @@ class LassoGuardrail(CustomGuardrail):
         # Always include sessionId (conversation_id - generated or provided)
         conversation_id = self._get_or_generate_conversation_id(data, cache)
         payload["sessionId"] = conversation_id
+
+        # Attribute the inference to the LiteLLM guardrail ("Used By" badge on Application API Keys).
+        payload["source"] = {"type": "litellm"}
 
         # Map OpenAI ChatCompletionToolParam array → ToolDefinition array
         tools_data: List[Dict[str, Any]] = data.get("tools") or []
@@ -805,7 +1007,51 @@ class LassoGuardrail(CustomGuardrail):
             if tool_definitions:
                 payload["tools"] = tool_definitions
 
+        if intent_ctx:
+            self._apply_intent(payload, intent_ctx, message_type, data, cache)
+
         return payload
+
+    def _apply_intent(
+        self,
+        payload: Dict[str, Any],
+        intent_ctx: Dict[str, Any],
+        message_type: Literal["PROMPT", "COMPLETION"],
+        data: dict,
+        cache: DualCache,
+    ) -> None:
+        """Stamp the classify payload with intent ids so the same call feeds the intent pipeline.
+
+        The PROMPT phase indexes the re-sent history from 0 and caches its reproducible-event count;
+        the COMPLETION phase continues from that offset (keyed by litellm_call_id, stable across the
+        pre/post hooks of one call) so the model's response sorts after the prompt and re-sent history
+        keeps identical, deduped ids.
+        """
+        # The app-seeded conversation id wins for sessionId so guardrail + intent agree on the dialogue.
+        if intent_ctx.get("session_id"):
+            payload["sessionId"] = intent_ctx["session_id"]
+        if intent_ctx.get("session_information"):
+            payload["sessionInformation"] = intent_ctx["session_information"]
+
+        call_id = data.get("litellm_call_id")
+        offset_key = f"lasso_event_offset:{call_id}" if call_id else None
+
+        start_index = 0
+        if message_type == "COMPLETION" and offset_key:
+            try:
+                cached = cache.get_cache(offset_key)
+                if cached is not None:
+                    start_index = int(cached)
+            except Exception as e:
+                verbose_proxy_logger.warning(f"Intent offset retrieval failed: {e}")
+
+        repro = _stamp_intent_messages(payload["messages"], intent_ctx["trace_id"], start_index)
+
+        if message_type == "PROMPT" and offset_key:
+            try:
+                cache.set_cache(offset_key, repro, ttl=3600)
+            except Exception as e:
+                verbose_proxy_logger.warning(f"Intent offset storage failed: {e}")
 
     async def _call_lasso_api(
         self,
