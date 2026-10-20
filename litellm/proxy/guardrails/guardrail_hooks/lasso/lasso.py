@@ -63,6 +63,16 @@ class LassoResponse(TypedDict):
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 
+_LASSO_ROLES: Final = frozenset({"user", "assistant", "system", "model", "developer"})
+_TOOL_OUTPUT_ROLES: Final = frozenset({"tool", "function"})
+
+
+def _lasso_role(role: object) -> str:
+    """Lasso rejects any other role with a 400, which fails the request closed."""
+    if role in _TOOL_OUTPUT_ROLES:
+        return "developer"
+    return role if isinstance(role, str) and role in _LASSO_ROLES else "user"
+
 
 class LassoGuardrailMissingSecrets(Exception):
     """Exception raised when Lasso API key is missing."""
@@ -403,7 +413,10 @@ class LassoGuardrail(CustomGuardrail):
             # Responses-API payloads carry text in data["input"]. Inspect it
             # alongside any "messages" array — otherwise a caller can attach
             # benign messages and stash blocked content in input to bypass.
-            messages.extend(build_inspection_messages({"input": data["input"]}))
+            inspected: Final = build_inspection_messages({"input": data["input"]})
+            messages.extend(
+                {"role": _lasso_role(message["role"]), "content": message["content"]} for message in inspected
+            )
         if not messages:
             return data
 
@@ -691,14 +704,14 @@ class LassoGuardrail(CustomGuardrail):
                     if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
                 ]
                 if text_parts:
-                    expanded.append({"role": role, "content": "\n".join(text_parts)})
+                    expanded.append({"role": _lasso_role(role), "content": "\n".join(text_parts)})
             elif content:
                 # Empty string and ``None`` are skipped on purpose: empty
                 # carries no inspectable text and ``None`` is the standard
                 # OpenAI shape for a pure tool-call turn. Dict content
                 # (pre-built tool_use/tool_result blocks from the post-call
                 # path) passes through unchanged.
-                expanded.append({"role": role, "content": content})
+                expanded.append({"role": _lasso_role(role), "content": content})
 
             if role == "assistant":
                 for call in msg.get("tool_calls") or []:

@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 from typing import Final
@@ -1549,3 +1550,54 @@ async def test_api_error_handling_legacy_messages(
     assert "Failed to verify request safety with Lasso API" in str(excinfo.value)
     assert error_message in str(excinfo.value)
     assert route.called
+
+
+async def _messages_sent_to_lasso(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, data: dict[str, object]
+) -> list[dict[str, object]]:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    clean: Final = {"violations_detected": False, "deputies": {}, "findings": {}}
+    route: Final = respx_mock.post("https://server.lasso.security/gateway/v3/classify").mock(
+        return_value=httpx.Response(200, json=clean)
+    )
+    guardrail: Final = LassoGuardrail(lasso_api_key="k", guardrail_name="g", event_hook="pre_call", default_on=True)
+    await guardrail.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(), cache=DualCache(), data=data, call_type="completion"
+    )
+    return json.loads(route.calls.last.request.content)["messages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("role", "sent_role"), (("function", "developer"), ("critic", "user"), ("developer", "developer")))
+async def test_roles_lasso_does_not_accept_are_mapped_instead_of_failing_the_request(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, role: str, sent_role: str
+) -> None:
+    data: Final = {"messages": [{"role": "user", "content": "q"}, {"role": role, "name": "f", "content": "result"}]}
+
+    messages: Final = await _messages_sent_to_lasso(respx_mock, monkeypatch, data)
+
+    assert messages == [{"role": "user", "content": "q"}, {"role": sent_role, "content": "result"}]
+
+
+@pytest.mark.asyncio
+async def test_responses_api_tool_outputs_are_sent_with_a_role_lasso_accepts(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data: Final = {
+        "input": [
+            {"role": "developer", "content": "rules"},
+            {"role": "user", "content": [{"type": "input_text", "text": "weather in Paris?"}]},
+            {"type": "function_call", "call_id": "fc_1", "name": "get_weather", "arguments": '{"city": "Paris"}'},
+            {"type": "function_call_output", "call_id": "fc_1", "output": "Sunny"},
+            {"type": "custom_tool_call_output", "call_id": "ct_1", "output": [{"type": "input_text", "text": "done"}]},
+        ]
+    }
+
+    messages: Final = await _messages_sent_to_lasso(respx_mock, monkeypatch, data)
+
+    assert messages == [
+        {"role": "developer", "content": "rules"},
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "developer", "content": "Sunny"},
+        {"role": "developer", "content": "done"},
+    ]
