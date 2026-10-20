@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 from typing import Final
@@ -8,6 +9,7 @@ import pytest
 import respx
 from fastapi import HTTPException
 from httpx import Request, Response
+from pydantic import TypeAdapter
 
 import litellm
 from litellm import DualCache
@@ -1548,4 +1550,321 @@ async def test_api_error_handling_legacy_messages(
 
     assert "Failed to verify request safety with Lasso API" in str(excinfo.value)
     assert error_message in str(excinfo.value)
+    assert route.called
+
+
+_CLASSIFY_URL: Final = "https://server.lasso.security/gateway/v3/classify"
+_TRACE_ID: Final = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+_CLEAN_VERDICT: Final[dict[str, object]] = {"violations_detected": False, "deputies": {}, "findings": {}}
+
+
+def _intent_guardrail(event_hook: str, conversation_id: str | None = None) -> LassoGuardrail:
+    return LassoGuardrail(
+        lasso_api_key="test-key",
+        conversation_id=conversation_id,
+        guardrail_name="intent-guard",
+        event_hook=event_hook,
+        default_on=True,
+    )
+
+
+def _request(session_id: str | None, headers: dict[str, str]) -> dict[str, object]:
+    return {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "user", "content": "Summarize my inbox"},
+        ],
+        "litellm_call_id": str(uuid.uuid4()),
+        "proxy_server_request": {"headers": headers},
+        **({"litellm_session_id": session_id} if session_id is not None else {}),
+    }
+
+
+_Payload: Final = TypeAdapter(dict[str, object])
+_Messages: Final = TypeAdapter(list[dict[str, object]])
+
+
+def _sent(route: respx.Route) -> tuple[dict[str, object], list[dict[str, object]], httpx.Headers]:
+    request: Final = route.calls.last.request
+    payload: Final = _Payload.validate_python(json.loads(request.content))
+    return payload, _Messages.validate_python(payload["messages"]), request.headers
+
+
+async def _run_pre_call(guardrail: LassoGuardrail, data: dict[str, object]) -> None:
+    await guardrail.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(), cache=DualCache(), data=data, call_type="completion"
+    )
+
+
+@pytest.fixture
+def classify_route(respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> respx.Route:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    return respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(200, json=_CLEAN_VERDICT))
+
+
+@pytest.mark.asyncio
+async def test_pre_call_sends_the_caller_session_trace_and_application_intent(classify_route: respx.Route) -> None:
+    data: Final = _request(
+        "chat-42",
+        {
+            "X-LiteLLM-Lasso-Trace-Id": _TRACE_ID.lower(),
+            "x-litellm-lasso-application-intent": "  Answer questions about the user's inbox  ",
+        },
+    )
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    payload, messages, headers = _sent(classify_route)
+    assert payload["sessionId"] == "chat-42"
+    assert headers["lasso-conversation-id"] == "chat-42"
+    assert [message["traceId"] for message in messages] == [_TRACE_ID, _TRACE_ID]
+    assert [message["content"] for message in messages] == [
+        message["content"] for message in _Messages.validate_python(data["messages"])
+    ]
+    assert payload["sessionInformation"] == {"applicationIntent": "Answer questions about the user's inbox"}
+
+
+@pytest.mark.asyncio
+async def test_post_call_keeps_the_request_session_and_trace(classify_route: respx.Route) -> None:
+    data: Final = _request("chat-42", {"x-litellm-lasso-trace-id": _TRACE_ID})
+    response: Final = litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": "3 unread emails"}}])
+
+    await _intent_guardrail("post_call").async_post_call_success_hook(
+        data=data, user_api_key_dict=UserAPIKeyAuth(), response=response
+    )
+
+    payload, messages, _ = _sent(classify_route)
+    assert payload["messageType"] == "COMPLETION"
+    assert payload["sessionId"] == "chat-42"
+    assert messages == [{"role": "assistant", "content": "3 unread emails", "traceId": _TRACE_ID}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trace_header",
+    ("", "not-a-ulid", "550e8400-e29b-41d4-a716-446655440000", "81ARZ3NDEKTSV4RRFFQ69G5FAV", _TRACE_ID + "X"),
+)
+async def test_a_trace_header_that_is_not_a_ulid_is_not_sent(classify_route: respx.Route, trace_header: str) -> None:
+    await _run_pre_call(_intent_guardrail("pre_call"), _request("chat-42", {"x-litellm-lasso-trace-id": trace_header}))
+
+    payload, messages, _ = _sent(classify_route)
+    assert payload["sessionId"] == "chat-42"
+    assert all("traceId" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", (None, "", "   ", "s" * 101))
+async def test_without_a_usable_caller_session_the_intent_headers_are_ignored(
+    classify_route: respx.Route, session_id: str | None
+) -> None:
+    data: Final = _request(
+        session_id,
+        {"x-litellm-lasso-trace-id": _TRACE_ID, "x-litellm-lasso-application-intent": "Answer inbox questions"},
+    )
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    payload, messages, _ = _sent(classify_route)
+    assert payload["sessionId"] not in (session_id, None)
+    assert len(str(payload["sessionId"])) <= 100
+    assert all("traceId" not in message for message in messages)
+    assert "sessionInformation" not in payload
+
+
+@pytest.mark.asyncio
+async def test_a_configured_conversation_id_wins_and_still_carries_the_intent_headers(
+    classify_route: respx.Route,
+) -> None:
+    data: Final = _request(None, {"x-litellm-lasso-trace-id": _TRACE_ID, "x-litellm-lasso-application-intent": "Inbox"})
+
+    await _run_pre_call(_intent_guardrail("pre_call", conversation_id="fixed-conversation"), data)
+
+    payload, messages, _ = _sent(classify_route)
+    assert payload["sessionId"] == "fixed-conversation"
+    assert all(message["traceId"] == _TRACE_ID for message in messages)
+    assert payload["sessionInformation"] == {"applicationIntent": "Inbox"}
+
+
+@pytest.mark.asyncio
+async def test_the_application_intent_is_capped(classify_route: respx.Route) -> None:
+    long_intent: Final = "a" * 2500
+
+    await _run_pre_call(
+        _intent_guardrail("pre_call"), _request("chat-42", {"x-litellm-lasso-application-intent": long_intent})
+    )
+
+    payload, _, _ = _sent(classify_route)
+    assert payload["sessionInformation"] == {"applicationIntent": long_intent[:2000]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("container", ("metadata", "litellm_metadata"))
+async def test_the_intent_headers_are_read_from_the_metadata_when_the_raw_request_is_missing(
+    classify_route: respx.Route, container: str
+) -> None:
+    data: Final = {
+        "messages": [{"role": "user", "content": "Summarize my inbox"}],
+        "litellm_session_id": "chat-42",
+        container: {"headers": {"x-litellm-lasso-trace-id": _TRACE_ID}},
+    }
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    _, messages, _ = _sent(classify_route)
+    assert [message["traceId"] for message in messages] == [_TRACE_ID]
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_the_lasso_headers_sends_the_same_fields_as_before(classify_route: respx.Route) -> None:
+    await _run_pre_call(_intent_guardrail("pre_call"), _request("chat-42", {"x-litellm-session-id": "chat-42"}))
+
+    payload, messages, _ = _sent(classify_route)
+    assert set(payload) == {"messages", "messageType", "source", "sessionId"}
+    assert all(set(message) == {"role", "content"} for message in messages)
+
+
+def _verdict(is_block: bool | None, finding_action: str) -> dict[str, object]:
+    return {
+        "violations_detected": True,
+        "deputies": {"jailbreak": True},
+        "findings": {"jailbreak": [{"action": finding_action, "severity": "HIGH"}]},
+        **({"is_block": is_block} if is_block is not None else {}),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_block", "finding_action", "blocked"),
+    (
+        (True, "ADMIN_ALERT", True),
+        (False, "BLOCK", False),
+        (None, "BLOCK", True),
+        (None, "ADMIN_ALERT", False),
+    ),
+    ids=("is_block-wins-over-findings", "is_block-false-wins", "old-gateway-blocks", "old-gateway-passes"),
+)
+async def test_is_block_decides_when_lasso_sends_it(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    is_block: bool | None,
+    finding_action: str,
+    blocked: bool,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(200, json=_verdict(is_block, finding_action)))
+    data: Final = _request("chat-42", {})
+
+    if not blocked:
+        await _run_pre_call(_intent_guardrail("pre_call"), data)
+        return
+    with pytest.raises(HTTPException) as excinfo:
+        await _run_pre_call(_intent_guardrail("pre_call"), data)
+    assert excinfo.value.status_code == 400
+    assert "Violated Lasso guardrail policy" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("role", "sent_role"), (("function", "developer"), ("critic", "user"), ("developer", "developer")))
+async def test_roles_lasso_does_not_accept_are_mapped_instead_of_failing_the_request(
+    classify_route: respx.Route, role: str, sent_role: str
+) -> None:
+    data: Final = {"messages": [{"role": "user", "content": "q"}, {"role": role, "name": "f", "content": "result"}]}
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    _, messages, _ = _sent(classify_route)
+    assert messages == [{"role": "user", "content": "q"}, {"role": sent_role, "content": "result"}]
+
+
+@pytest.mark.asyncio
+async def test_responses_api_tool_outputs_are_sent_with_a_role_lasso_accepts(classify_route: respx.Route) -> None:
+    data: Final = {
+        "input": [
+            {"role": "developer", "content": "rules"},
+            {"role": "user", "content": [{"type": "input_text", "text": "weather in Paris?"}]},
+            {"type": "function_call", "call_id": "fc_1", "name": "get_weather", "arguments": '{"city": "Paris"}'},
+            {"type": "function_call_output", "call_id": "fc_1", "output": "Sunny"},
+            {"type": "custom_tool_call_output", "call_id": "ct_1", "output": [{"type": "input_text", "text": "done"}]},
+        ]
+    }
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    _, messages, _ = _sent(classify_route)
+    assert messages == [
+        {"role": "developer", "content": "rules"},
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "developer", "content": "Sunny"},
+        {"role": "developer", "content": "done"},
+    ]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intent_finding", "jailbreak_action", "named"),
+    (
+        ({"action": "BLOCK"}, "ADMIN_ALERT", "intent"),
+        ({"action": "BLOCK"}, "BLOCK", "jailbreak, intent"),
+        ({"action": "BLOCK", "monitorOnly": True}, "BLOCK", "jailbreak"),
+        ({"action": "ADMIN_ALERT"}, "BLOCK", "jailbreak"),
+    ),
+    ids=("intent-only", "deputy-and-intent", "intent-monitor-only", "intent-alert"),
+)
+async def test_the_block_names_intent_when_an_intent_finding_blocks(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    intent_finding: dict[str, object],
+    jailbreak_action: str,
+    named: str,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    verdict: Final = {
+        "violations_detected": True,
+        "deputies": {"jailbreak": True},
+        "findings": {"jailbreak": [{"action": jailbreak_action, "severity": "HIGH"}]},
+        "intent_findings": [{"trace_id": _TRACE_ID, "violations": ["DATA_EXFILTRATION"], **intent_finding}],
+        "is_block": True,
+    }
+    respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(200, json=verdict))
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _run_pre_call(_intent_guardrail("pre_call"), _request("chat-42", {}))
+
+    assert f"Blocking violations detected: {named}'" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mask", "endpoint"), ((True, "classifix"), (False, "classify")))
+async def test_mask_from_the_config_file_picks_the_lasso_endpoint(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, mask: bool, endpoint: str
+) -> None:
+    from litellm.proxy.guardrails.guardrail_registry import IN_MEMORY_GUARDRAIL_HANDLER
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "IN_MEMORY_GUARDRAILS", {})
+    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "guardrail_id_to_custom_guardrail", {})
+    init_guardrails_v2(
+        all_guardrails=[
+            {
+                "guardrail_name": "lasso-pre-guard",
+                "litellm_params": {
+                    "guardrail": "lasso",
+                    "mode": "pre_call",
+                    "default_on": True,
+                    "api_key": "test-key",
+                    "mask": mask,
+                },
+            }
+        ],
+        config_file_path="",
+    )
+    guardrail: Final = next(iter(IN_MEMORY_GUARDRAIL_HANDLER.guardrail_id_to_custom_guardrail.values()))
+    assert isinstance(guardrail, LassoGuardrail)
+    route: Final = respx_mock.post(f"https://server.lasso.security/gateway/v3/{endpoint}").mock(
+        return_value=httpx.Response(200, json={**_CLEAN_VERDICT, "messages": []})
+    )
+
+    await _run_pre_call(guardrail, {"messages": [{"role": "user", "content": "email alice@example.com"}]})
+
     assert route.called

@@ -7,9 +7,11 @@
 
 import json
 import os
+import re
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
 
 try:
     import ulid
@@ -28,6 +30,8 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from fastapi import HTTPException
+from pydantic import TypeAdapter, ValidationError
+from typing_extensions import ReadOnly
 
 import litellm
 from litellm import DualCache
@@ -58,10 +62,64 @@ class LassoResponse(TypedDict):
     deputies: dict[str, bool]
     findings: dict[str, list[dict[str, object]]]
     messages: list[dict[str, str]] | None
+    is_block: ReadOnly[NotRequired[bool]]
+    intent_findings: ReadOnly[NotRequired[Sequence[Mapping[str, object]]]]
 
 
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
+
+_SESSION_ID_MAX_LENGTH: Final = 100
+_APPLICATION_INTENT_MAX_LENGTH: Final = 2000
+_TRACE_ID_HEADER: Final = "x-litellm-lasso-trace-id"
+_APPLICATION_INTENT_HEADER: Final = "x-litellm-lasso-application-intent"
+_ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
+_HEADER_CONTAINERS: Final = ("proxy_server_request", "metadata", "litellm_metadata")
+_REQUEST_CONTEXT_KEYS: Final = ("litellm_call_id", "litellm_session_id", *_HEADER_CONTAINERS)
+_STR_MAPPING: Final = TypeAdapter(dict[str, object])
+_EMPTY_MAPPING: Final[Mapping[str, object]] = MappingProxyType[str, object]({})
+_LASSO_ROLES: Final = frozenset({"user", "assistant", "system", "model", "developer"})
+_TOOL_OUTPUT_ROLES: Final = frozenset({"tool", "function"})
+
+
+def _caller_session_id(data: object) -> str | None:
+    session_id: Final = _as_str_mapping(data).get("litellm_session_id")
+    if not isinstance(session_id, str):
+        return None
+    stripped: Final = session_id.strip()
+    return stripped if 0 < len(stripped) <= _SESSION_ID_MAX_LENGTH else None
+
+
+def _as_str_mapping(value: object) -> Mapping[str, object]:
+    try:
+        return _STR_MAPPING.validate_python(value)
+    except ValidationError:
+        return _EMPTY_MAPPING
+
+
+def _inbound_headers(data: object) -> Mapping[str, str]:
+    request: Final = _as_str_mapping(data)
+    candidates: Final = (
+        _as_str_mapping(_as_str_mapping(request.get(key)).get("headers")) for key in _HEADER_CONTAINERS
+    )
+    headers: Final = next((found for found in candidates if found), _EMPTY_MAPPING)
+    return MappingProxyType({name.lower(): value for name, value in headers.items() if isinstance(value, str)})
+
+
+def _lasso_role(role: object) -> str:
+    """Lasso rejects any other role with a 400, which fails the request closed."""
+    if role in _TOOL_OUTPUT_ROLES:
+        return "developer"
+    return role if isinstance(role, str) and role in _LASSO_ROLES else "user"
+
+
+def _intent_fields(data: object, has_configured_session: bool) -> tuple[str | None, str | None]:
+    if not (has_configured_session or _caller_session_id(data)):
+        return (None, None)
+    headers: Final = _inbound_headers(data)
+    trace_id: Final = headers.get(_TRACE_ID_HEADER, "").strip()
+    application_intent: Final = headers.get(_APPLICATION_INTENT_HEADER, "").strip()[:_APPLICATION_INTENT_MAX_LENGTH]
+    return (trace_id.upper() if _ULID_PATTERN.fullmatch(trace_id) else None, application_intent or None)
 
 
 class LassoGuardrailMissingSecrets(Exception):
@@ -113,14 +171,14 @@ class LassoGuardrail(CustomGuardrail):
 
         self.api_base = api_base or os.getenv("LASSO_API_BASE") or "https://server.lasso.security/gateway/v3"
 
+        super().__init__(**kwargs)
+
         verbose_proxy_logger.debug(
             "Lasso guardrail initialized: %s, event_hook: %s, mask: %s",
-            kwargs.get("guardrail_name", "unknown"),
-            kwargs.get("event_hook", "unknown"),
+            self.guardrail_name or "unknown",
+            self.event_hook or "unknown",
             self.mask,
         )
-
-        super().__init__(**kwargs)
 
     @staticmethod
     def _get_field(obj: object, field: str, default: object = None) -> object:
@@ -275,10 +333,9 @@ class LassoGuardrail(CustomGuardrail):
                     )
 
             if response_messages:
-                # Include litellm_call_id from original data for conversation_id consistency
                 response_data: Final = {
+                    **{key: data[key] for key in _REQUEST_CONTEXT_KEYS if key in data},
                     "messages": response_messages,
-                    "litellm_call_id": data.get("litellm_call_id"),
                 }
 
                 # Handle masking for post-call
@@ -317,9 +374,9 @@ class LassoGuardrail(CustomGuardrail):
         """
         Get or generate a conversation_id for this request.
 
-        This method ensures session consistency by using litellm_call_id as a cache key.
-        The same conversation_id is used for both pre-call and post-call hooks within
-        the same request, enabling proper conversation grouping in Lasso UI.
+        A configured conversation_id wins, then the caller's session (``litellm_session_id``, set from
+        ``x-litellm-session-id`` and friends). Otherwise one id is generated per request, cached by
+        litellm_call_id so the pre-call and post-call hooks share it.
 
         Example:
             >>> guardrail = LassoGuardrail(lasso_api_key="key")
@@ -337,6 +394,10 @@ class LassoGuardrail(CustomGuardrail):
         # Use global conversation_id if set
         if self.conversation_id:
             return self.conversation_id
+
+        caller_session_id: Final = _caller_session_id(data)
+        if caller_session_id:
+            return caller_session_id
 
         # Get the litellm_call_id which is consistent across all hooks for this request
         litellm_call_id: Final = data.get("litellm_call_id")
@@ -403,7 +464,10 @@ class LassoGuardrail(CustomGuardrail):
             # Responses-API payloads carry text in data["input"]. Inspect it
             # alongside any "messages" array — otherwise a caller can attach
             # benign messages and stash blocked content in input to bypass.
-            messages.extend(build_inspection_messages({"input": data["input"]}))
+            inspected: Final = build_inspection_messages({"input": data["input"]})
+            messages.extend(
+                {"role": _lasso_role(message["role"]), "content": message["content"]} for message in inspected
+            )
         if not messages:
             return data
 
@@ -691,14 +755,14 @@ class LassoGuardrail(CustomGuardrail):
                     if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
                 ]
                 if text_parts:
-                    expanded.append({"role": role, "content": "\n".join(text_parts)})
+                    expanded.append({"role": _lasso_role(role), "content": "\n".join(text_parts)})
             elif content:
                 # Empty string and ``None`` are skipped on purpose: empty
                 # carries no inspectable text and ``None`` is the standard
                 # OpenAI shape for a pure tool-call turn. Dict content
                 # (pre-built tool_use/tool_result blocks from the post-call
                 # path) passes through unchanged.
-                expanded.append({"role": role, "content": content})
+                expanded.append({"role": _lasso_role(role), "content": content})
 
             if role == "assistant":
                 for call in msg.get("tool_calls") or []:
@@ -763,12 +827,15 @@ class LassoGuardrail(CustomGuardrail):
             data: Request data (used for conversation_id generation and tools extraction)
             cache: Cache instance for storing conversation_id (optional for post-call)
         """
+        # Lasso scores intent per session, so the app's trace and intent headers only count with a real one
+        trace_id, application_intent = _intent_fields(data, has_configured_session=bool(self.conversation_id))
         payload: Final[dict[str, object]] = {
-            "messages": messages,
+            "messages": [{**message, "traceId": trace_id} for message in messages] if trace_id else messages,
             "messageType": message_type,
             # Drives the "Used By" badge on Lasso Application API Keys: every call from this
             # integration is attributed as "litellm" on the keys list.
             "source": {"type": "litellm"},
+            **({"sessionInformation": {"applicationIntent": application_intent}} if application_intent else {}),
         }
 
         # Add optional parameters if available
@@ -846,22 +913,26 @@ class LassoGuardrail(CustomGuardrail):
             response: The response dictionary from Lasso API
 
         Raises:
-            HTTPException: If any finding has "action": "BLOCK"
+            HTTPException: If Lasso's ``is_block`` is true, or, from gateways that don't send it, if any finding
+                has "action": "BLOCK"
         """
         if response and response.get("violations_detected") is True:
             violated_deputies: Final = self._parse_violated_deputies(response)
             verbose_proxy_logger.warning("Lasso guardrail detected violations: %s", violated_deputies)
 
-            # Check if any findings have "BLOCK" action
             blocking_violations: Final = self._check_for_blocking_actions(response)
+            # is_block also counts findings that never reach `findings`, such as intent findings
+            is_block: Final = response.get("is_block")
+            should_block: Final = is_block if isinstance(is_block, bool) else bool(blocking_violations)
 
-            if blocking_violations:
-                # Block the request/response for findings with "BLOCK" action
+            if should_block:
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "Violated Lasso guardrail policy",
-                        "detection_message": f"Blocking violations detected: {', '.join(blocking_violations)}",
+                        "detection_message": (
+                            f"Blocking violations detected: {', '.join(blocking_violations) or 'Lasso policy'}"
+                        ),
                         "lasso_response": response,
                     },
                 )
@@ -884,7 +955,8 @@ class LassoGuardrail(CustomGuardrail):
             response: The response dictionary from Lasso API
 
         Returns:
-            List[str]: Names of deputies with blocking violations
+            List[str]: Names of deputies with blocking violations, plus "intent" when an intent finding
+                blocks (a "BLOCK" action that isn't monitor-only, the same rule Lasso's ``is_block`` uses)
 
         Example:
             >>> response = {
@@ -906,6 +978,10 @@ class LassoGuardrail(CustomGuardrail):
                         if deputy_name not in blocking_violations:
                             blocking_violations.append(deputy_name)
                         break  # No need to check other findings for this deputy
+
+        intent_findings: Final = response.get("intent_findings") or ()
+        if any(finding.get("action") == "BLOCK" and not finding.get("monitorOnly") for finding in intent_findings):
+            blocking_violations.append("intent")
 
         return blocking_violations
 
