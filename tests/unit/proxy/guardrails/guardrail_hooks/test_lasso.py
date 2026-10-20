@@ -1869,3 +1869,23 @@ async def test_the_longest_agent_name_lasso_accepts_is_sent(classify_route: resp
 
     payload, _, _ = _sent(classify_route)
     assert payload["source"] == {"type": "litellm", "agentName": longest}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "agent_id"),
+    (
+        ({"x-litellm-lasso-agent-id": "inbox-agent-7", "x-litellm-agent-id": "litellm-agent"}, "inbox-agent-7"),
+        ({"x-litellm-agent-id": "3f2b9c1e-5d4a-4f6b-8e7d-1a2b3c4d5e6f"}, "3f2b9c1e-5d4a-4f6b-8e7d-1a2b3c4d5e6f"),
+        ({"x-litellm-lasso-agent-id": "inbox\u200bagent", "x-litellm-agent-id": "litellm-agent"}, "litellm-agent"),
+        ({"x-litellm-lasso-agent-id": "  "}, None),
+    ),
+    ids=("ours-wins", "litellm-fallback", "invalid-ours-falls-back", "nothing-valid"),
+)
+async def test_lassos_agent_id_header_wins_over_litellms(
+    classify_route: respx.Route, headers: dict[str, str], agent_id: str | None
+) -> None:
+    await _run_pre_call(_intent_guardrail("pre_call"), _request(None, headers))
+
+    payload, _, _ = _sent(classify_route)
+    assert payload["source"] == {"type": "litellm", **({"agentId": agent_id} if agent_id else {})}

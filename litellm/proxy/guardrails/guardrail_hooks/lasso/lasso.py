@@ -75,7 +75,8 @@ _SESSION_ID_MAX_LENGTH: Final = 100
 _APPLICATION_INTENT_MAX_LENGTH: Final = 2000
 _TRACE_ID_HEADER: Final = "x-litellm-lasso-trace-id"
 _APPLICATION_INTENT_HEADER: Final = "x-litellm-lasso-application-intent"
-_AGENT_ID_HEADER: Final = "x-litellm-agent-id"
+_AGENT_ID_HEADER: Final = "x-litellm-lasso-agent-id"
+_LITELLM_AGENT_ID_HEADER: Final = "x-litellm-agent-id"
 _AGENT_NAME_HEADER: Final = "x-litellm-lasso-agent-name"
 _AGENT_IDENTITY_MAX_LENGTH: Final = 128
 _ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
@@ -134,7 +135,11 @@ def _header_fields(
     """
     headers: Final = _inbound_headers(data)
     agent_candidates: Final = (
-        ("agentId", _agent_identity(headers.get(_AGENT_ID_HEADER))),
+        # Ours wins, LiteLLM's own agent header (which it also writes into spend metadata) is the fallback
+        (
+            "agentId",
+            _agent_identity(headers.get(_AGENT_ID_HEADER)) or _agent_identity(headers.get(_LITELLM_AGENT_ID_HEADER)),
+        ),
         ("agentName", _agent_identity(headers.get(_AGENT_NAME_HEADER))),
     )
     agent: Final = tuple((key, value) for key, value in agent_candidates if value)
