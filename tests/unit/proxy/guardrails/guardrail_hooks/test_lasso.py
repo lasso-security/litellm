@@ -1549,3 +1549,45 @@ async def test_api_error_handling_legacy_messages(
     assert "Failed to verify request safety with Lasso API" in str(excinfo.value)
     assert error_message in str(excinfo.value)
     assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mask", "endpoint"), ((True, "classifix"), (False, "classify")))
+async def test_mask_from_the_config_file_picks_the_lasso_endpoint(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, mask: bool, endpoint: str
+) -> None:
+    from litellm.proxy.guardrails.guardrail_registry import IN_MEMORY_GUARDRAIL_HANDLER
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "IN_MEMORY_GUARDRAILS", {})
+    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "guardrail_id_to_custom_guardrail", {})
+    init_guardrails_v2(
+        all_guardrails=[
+            {
+                "guardrail_name": "lasso-pre-guard",
+                "litellm_params": {
+                    "guardrail": "lasso",
+                    "mode": "pre_call",
+                    "default_on": True,
+                    "api_key": "test-key",
+                    "mask": mask,
+                },
+            }
+        ],
+        config_file_path="",
+    )
+    guardrail: Final = next(iter(IN_MEMORY_GUARDRAIL_HANDLER.guardrail_id_to_custom_guardrail.values()))
+    assert isinstance(guardrail, LassoGuardrail)
+    clean: Final = {"violations_detected": False, "deputies": {}, "findings": {}, "messages": []}
+    route: Final = respx_mock.post(f"https://server.lasso.security/gateway/v3/{endpoint}").mock(
+        return_value=httpx.Response(200, json=clean)
+    )
+
+    await guardrail.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(),
+        cache=DualCache(),
+        data={"messages": [{"role": "user", "content": "email alice@example.com"}]},
+        call_type="completion",
+    )
+
+    assert route.called
