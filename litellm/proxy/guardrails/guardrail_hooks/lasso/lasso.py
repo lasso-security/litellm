@@ -80,8 +80,6 @@ _HEADER_CONTAINERS: Final = ("proxy_server_request", *_METADATA_CONTAINERS)
 _REQUEST_CONTEXT_KEYS: Final = ("litellm_call_id", "litellm_session_id", *_HEADER_CONTAINERS)
 _STR_MAPPING: Final = TypeAdapter(dict[str, object])
 _EMPTY_MAPPING: Final[Mapping[str, object]] = MappingProxyType[str, object]({})
-_LASSO_ROLES: Final = frozenset({"user", "assistant", "system", "model", "developer"})
-_TOOL_OUTPUT_ROLES: Final = frozenset({"tool", "function"})
 
 
 def _caller_session_id(data: object) -> str | None:
@@ -111,13 +109,6 @@ def _inbound_headers(data: object) -> Mapping[str, str]:
     )
     headers: Final = next((found for found in candidates if found), _EMPTY_MAPPING)
     return MappingProxyType({name.lower(): value for name, value in headers.items() if isinstance(value, str)})
-
-
-def _lasso_role(role: object) -> str:
-    """Lasso rejects any other role with a 400, which fails the request closed."""
-    if role in _TOOL_OUTPUT_ROLES:
-        return "developer"
-    return role if isinstance(role, str) and role in _LASSO_ROLES else "user"
 
 
 def _intent_fields(data: object, has_configured_session: bool) -> tuple[str | None, str | None]:
@@ -471,10 +462,7 @@ class LassoGuardrail(CustomGuardrail):
             # Responses-API payloads carry text in data["input"]. Inspect it
             # alongside any "messages" array — otherwise a caller can attach
             # benign messages and stash blocked content in input to bypass.
-            inspected: Final = build_inspection_messages({"input": data["input"]})
-            messages.extend(
-                {"role": _lasso_role(message["role"]), "content": message["content"]} for message in inspected
-            )
+            messages.extend(build_inspection_messages({"input": data["input"]}))
         if not messages:
             return data
 
@@ -762,14 +750,14 @@ class LassoGuardrail(CustomGuardrail):
                     if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
                 ]
                 if text_parts:
-                    expanded.append({"role": _lasso_role(role), "content": "\n".join(text_parts)})
+                    expanded.append({"role": role, "content": "\n".join(text_parts)})
             elif content:
                 # Empty string and ``None`` are skipped on purpose: empty
                 # carries no inspectable text and ``None`` is the standard
                 # OpenAI shape for a pure tool-call turn. Dict content
                 # (pre-built tool_use/tool_result blocks from the post-call
                 # path) passes through unchanged.
-                expanded.append({"role": _lasso_role(role), "content": content})
+                expanded.append({"role": role, "content": content})
 
             if role == "assistant":
                 for call in msg.get("tool_calls") or []:

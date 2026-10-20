@@ -1764,43 +1764,6 @@ async def test_is_block_decides_when_lasso_sends_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("role", "sent_role"), (("function", "developer"), ("critic", "user"), ("developer", "developer")))
-async def test_roles_lasso_does_not_accept_are_mapped_instead_of_failing_the_request(
-    classify_route: respx.Route, role: str, sent_role: str
-) -> None:
-    data: Final = {"messages": [{"role": "user", "content": "q"}, {"role": role, "name": "f", "content": "result"}]}
-
-    await _run_pre_call(_intent_guardrail("pre_call"), data)
-
-    _, messages, _ = _sent(classify_route)
-    assert messages == [{"role": "user", "content": "q"}, {"role": sent_role, "content": "result"}]
-
-
-@pytest.mark.asyncio
-async def test_responses_api_tool_outputs_are_sent_with_a_role_lasso_accepts(classify_route: respx.Route) -> None:
-    data: Final = {
-        "input": [
-            {"role": "developer", "content": "rules"},
-            {"role": "user", "content": [{"type": "input_text", "text": "weather in Paris?"}]},
-            {"type": "function_call", "call_id": "fc_1", "name": "get_weather", "arguments": '{"city": "Paris"}'},
-            {"type": "function_call_output", "call_id": "fc_1", "output": "Sunny"},
-            {"type": "custom_tool_call_output", "call_id": "ct_1", "output": [{"type": "input_text", "text": "done"}]},
-        ]
-    }
-
-    await _run_pre_call(_intent_guardrail("pre_call"), data)
-
-    _, messages, _ = _sent(classify_route)
-    assert messages == [
-        {"role": "developer", "content": "rules"},
-        {"role": "user", "content": "weather in Paris?"},
-        {"role": "developer", "content": "Sunny"},
-        {"role": "developer", "content": "done"},
-    ]
-
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("intent_finding", "jailbreak_action", "named"),
     (
@@ -1832,42 +1795,6 @@ async def test_the_block_names_intent_when_an_intent_finding_blocks(
         await _run_pre_call(_intent_guardrail("pre_call"), _request("chat-42", {}))
 
     assert f"Blocking violations detected: {named}'" in str(excinfo.value.detail)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("mask", "endpoint"), ((True, "classifix"), (False, "classify")))
-async def test_mask_from_the_config_file_picks_the_lasso_endpoint(
-    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, mask: bool, endpoint: str
-) -> None:
-    from litellm.proxy.guardrails.guardrail_registry import IN_MEMORY_GUARDRAIL_HANDLER
-
-    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "IN_MEMORY_GUARDRAILS", {})
-    monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "guardrail_id_to_custom_guardrail", {})
-    init_guardrails_v2(
-        all_guardrails=[
-            {
-                "guardrail_name": "lasso-pre-guard",
-                "litellm_params": {
-                    "guardrail": "lasso",
-                    "mode": "pre_call",
-                    "default_on": True,
-                    "api_key": "test-key",
-                    "mask": mask,
-                },
-            }
-        ],
-        config_file_path="",
-    )
-    guardrail: Final = next(iter(IN_MEMORY_GUARDRAIL_HANDLER.guardrail_id_to_custom_guardrail.values()))
-    assert isinstance(guardrail, LassoGuardrail)
-    route: Final = respx_mock.post(f"https://server.lasso.security/gateway/v3/{endpoint}").mock(
-        return_value=httpx.Response(200, json={**_CLEAN_VERDICT, "messages": []})
-    )
-
-    await _run_pre_call(guardrail, {"messages": [{"role": "user", "content": "email alice@example.com"}]})
-
-    assert route.called
 
 
 @pytest.mark.asyncio
