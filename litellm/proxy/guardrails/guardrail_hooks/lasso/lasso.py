@@ -37,6 +37,7 @@ import litellm
 from litellm import DualCache
 from litellm._internal_context import with_service_target
 from litellm._logging import verbose_proxy_logger
+from litellm.constants import SESSION_ID_GENERATED_METADATA_KEY
 from litellm.integrations.custom_guardrail import (
     GUARDRAIL_SESSIONS_TARGET,
     CustomGuardrail,
@@ -74,7 +75,8 @@ _APPLICATION_INTENT_MAX_LENGTH: Final = 2000
 _TRACE_ID_HEADER: Final = "x-litellm-lasso-trace-id"
 _APPLICATION_INTENT_HEADER: Final = "x-litellm-lasso-application-intent"
 _ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
-_HEADER_CONTAINERS: Final = ("proxy_server_request", "metadata", "litellm_metadata")
+_METADATA_CONTAINERS: Final = ("metadata", "litellm_metadata")
+_HEADER_CONTAINERS: Final = ("proxy_server_request", *_METADATA_CONTAINERS)
 _REQUEST_CONTEXT_KEYS: Final = ("litellm_call_id", "litellm_session_id", *_HEADER_CONTAINERS)
 _STR_MAPPING: Final = TypeAdapter(dict[str, object])
 _EMPTY_MAPPING: Final[Mapping[str, object]] = MappingProxyType[str, object]({})
@@ -83,8 +85,13 @@ _TOOL_OUTPUT_ROLES: Final = frozenset({"tool", "function"})
 
 
 def _caller_session_id(data: object) -> str | None:
-    session_id: Final = _as_str_mapping(data).get("litellm_session_id")
-    if not isinstance(session_id, str):
+    request: Final = _as_str_mapping(data)
+    # LiteLLM's missing_session_id: generate policy mints a new id per call when the caller sent none
+    generated: Final = any(
+        _as_str_mapping(request.get(key)).get(SESSION_ID_GENERATED_METADATA_KEY) for key in _METADATA_CONTAINERS
+    )
+    session_id: Final = request.get("litellm_session_id")
+    if generated or not isinstance(session_id, str):
         return None
     stripped: Final = session_id.strip()
     return stripped if 0 < len(stripped) <= _SESSION_ID_MAX_LENGTH else None

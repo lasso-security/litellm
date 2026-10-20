@@ -1868,3 +1868,25 @@ async def test_mask_from_the_config_file_picks_the_lasso_endpoint(
     await _run_pre_call(guardrail, {"messages": [{"role": "user", "content": "email alice@example.com"}]})
 
     assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+async def test_a_session_litellm_generated_is_not_treated_as_the_callers(
+    classify_route: respx.Route, metadata_key: str
+) -> None:
+    generated_session: Final = str(uuid.uuid4())
+    data: Final = {
+        **_request(
+            generated_session,
+            {"x-litellm-lasso-trace-id": _TRACE_ID, "x-litellm-lasso-application-intent": "Answer inbox questions"},
+        ),
+        metadata_key: {"session_id": generated_session, "litellm_session_id_generated": True},
+    }
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    payload, messages, _ = _sent(classify_route)
+    assert payload["sessionId"] != generated_session
+    assert all("traceId" not in message for message in messages)
+    assert "sessionInformation" not in payload
