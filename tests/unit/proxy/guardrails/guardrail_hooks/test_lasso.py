@@ -1817,3 +1817,55 @@ async def test_a_session_litellm_generated_is_not_treated_as_the_callers(
     assert payload["sessionId"] != generated_session
     assert all("traceId" not in message for message in messages)
     assert "sessionInformation" not in payload
+
+
+@pytest.mark.asyncio
+async def test_agent_headers_attribute_both_checks_to_the_agent(classify_route: respx.Route) -> None:
+    data: Final = {
+        "messages": [{"role": "user", "content": "Summarize my inbox"}],
+        "litellm_call_id": str(uuid.uuid4()),
+        "proxy_server_request": {
+            "headers": {"X-LiteLLM-Agent-Id": "  inbox-agent-7  ", "x-litellm-lasso-agent-name": "Inbox Assistant"}
+        },
+    }
+    response: Final = litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": "3 unread"}}])
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+    await _intent_guardrail("post_call").async_post_call_success_hook(
+        data=data, user_api_key_dict=UserAPIKeyAuth(), response=response
+    )
+
+    sent: Final = [json.loads(call.request.content) for call in classify_route.calls]
+    assert [payload["messageType"] for payload in sent] == ["PROMPT", "COMPLETION"]
+    assert all(
+        payload["source"] == {"type": "litellm", "agentId": "inbox-agent-7", "agentName": "Inbox Assistant"}
+        for payload in sent
+    )
+    assert all("agentId" not in payload and "agentName" not in payload for payload in sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_name",
+    ("", "   ", "a" * 129, "\U0001f916" * 65, "Inbox​Assistant", "‮Inbox", "Inbox\nAssistant"),
+    ids=("empty", "blank", "129-chars", "65-emoji-is-130-utf16-units", "zero-width", "bidi-override", "newline"),
+)
+async def test_an_agent_name_lasso_would_reject_is_dropped_and_the_call_still_goes_through(
+    classify_route: respx.Route, agent_name: str
+) -> None:
+    data: Final = _request(None, {"x-litellm-agent-id": "inbox-agent-7", "x-litellm-lasso-agent-name": agent_name})
+
+    await _run_pre_call(_intent_guardrail("pre_call"), data)
+
+    payload, _, _ = _sent(classify_route)
+    assert payload["source"] == {"type": "litellm", "agentId": "inbox-agent-7"}
+
+
+@pytest.mark.asyncio
+async def test_the_longest_agent_name_lasso_accepts_is_sent(classify_route: respx.Route) -> None:
+    longest: Final = "\U0001f916" * 64
+
+    await _run_pre_call(_intent_guardrail("pre_call"), _request(None, {"x-litellm-lasso-agent-name": longest}))
+
+    payload, _, _ = _sent(classify_route)
+    assert payload["source"] == {"type": "litellm", "agentName": longest}

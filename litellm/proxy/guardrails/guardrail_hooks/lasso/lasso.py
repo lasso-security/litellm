@@ -8,6 +8,7 @@
 import json
 import os
 import re
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
@@ -74,6 +75,9 @@ _SESSION_ID_MAX_LENGTH: Final = 100
 _APPLICATION_INTENT_MAX_LENGTH: Final = 2000
 _TRACE_ID_HEADER: Final = "x-litellm-lasso-trace-id"
 _APPLICATION_INTENT_HEADER: Final = "x-litellm-lasso-application-intent"
+_AGENT_ID_HEADER: Final = "x-litellm-agent-id"
+_AGENT_NAME_HEADER: Final = "x-litellm-lasso-agent-name"
+_AGENT_IDENTITY_MAX_LENGTH: Final = 128
 _ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
 _METADATA_CONTAINERS: Final = ("metadata", "litellm_metadata")
 _HEADER_CONTAINERS: Final = ("proxy_server_request", *_METADATA_CONTAINERS)
@@ -111,13 +115,34 @@ def _inbound_headers(data: object) -> Mapping[str, str]:
     return MappingProxyType({name.lower(): value for name, value in headers.items() if isinstance(value, str)})
 
 
-def _intent_fields(data: object, has_configured_session: bool) -> tuple[str | None, str | None]:
-    if not (has_configured_session or _caller_session_id(data)):
-        return (None, None)
+def _agent_identity(value: str | None) -> str | None:
+    """Lasso's rule for an agent id or name: trimmed, 1 to 128 UTF-16 units, no control or format characters."""
+    trimmed: Final = (value or "").strip()
+    utf16_length: Final = len(trimmed.encode("utf-16-le")) // 2
+    if not 0 < utf16_length <= _AGENT_IDENTITY_MAX_LENGTH:
+        return None
+    return None if any(unicodedata.category(char) in ("Cc", "Cf") for char in trimmed) else trimmed
+
+
+def _header_fields(
+    data: object, has_configured_session: bool
+) -> tuple[str | None, str | None, tuple[tuple[str, str], ...]]:
+    """The trace id, application intent and agent (as ``source`` keys) the app sent in its headers.
+
+    The agent goes in ``source`` rather than the request's agentId / agentName, which gateways before 0.9 reject with a
+    400. Newer gateways read it from ``source`` when those are absent. Trace and intent count only with a real session.
+    """
     headers: Final = _inbound_headers(data)
+    agent_candidates: Final = (
+        ("agentId", _agent_identity(headers.get(_AGENT_ID_HEADER))),
+        ("agentName", _agent_identity(headers.get(_AGENT_NAME_HEADER))),
+    )
+    agent: Final = tuple((key, value) for key, value in agent_candidates if value)
+    if not (has_configured_session or _caller_session_id(data)):
+        return (None, None, agent)
     trace_id: Final = headers.get(_TRACE_ID_HEADER, "").strip()
     application_intent: Final = headers.get(_APPLICATION_INTENT_HEADER, "").strip()[:_APPLICATION_INTENT_MAX_LENGTH]
-    return (trace_id.upper() if _ULID_PATTERN.fullmatch(trace_id) else None, application_intent or None)
+    return (trace_id.upper() if _ULID_PATTERN.fullmatch(trace_id) else None, application_intent or None, agent)
 
 
 class LassoGuardrailMissingSecrets(Exception):
@@ -823,13 +848,13 @@ class LassoGuardrail(CustomGuardrail):
             cache: Cache instance for storing conversation_id (optional for post-call)
         """
         # Lasso scores intent per session, so the app's trace and intent headers only count with a real one
-        trace_id, application_intent = _intent_fields(data, has_configured_session=bool(self.conversation_id))
+        trace_id, application_intent, agent = _header_fields(data, has_configured_session=bool(self.conversation_id))
         payload: Final[dict[str, object]] = {
             "messages": [{**message, "traceId": trace_id} for message in messages] if trace_id else messages,
             "messageType": message_type,
             # Drives the "Used By" badge on Lasso Application API Keys: every call from this
             # integration is attributed as "litellm" on the keys list.
-            "source": {"type": "litellm"},
+            "source": {"type": "litellm", **dict(agent)},
             **({"sessionInformation": {"applicationIntent": application_intent}} if application_intent else {}),
         }
 
