@@ -11,7 +11,7 @@ import re
 import uuid
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
 
 try:
     import ulid
@@ -31,7 +31,7 @@ except ImportError:
 
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
-from typing_extensions import ReadOnly
+from typing_extensions import NotRequired, ReadOnly
 
 import litellm
 from litellm import DualCache
