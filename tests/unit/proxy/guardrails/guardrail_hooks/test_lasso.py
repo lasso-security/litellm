@@ -1832,63 +1832,7 @@ async def test_lassos_agent_id_header_wins_over_litellms(
 
 
 @pytest.mark.asyncio
-async def test_percent_encoded_headers_arrive_decoded(classify_route: respx.Route) -> None:
-    data: Final = _request(
-        "chat-42",
-        {
-            "x-lasso-encoding": "pct",
-            "x-lasso-application-intent": "%D7%A1%D7%95%D7%9B%D7%9F%20%D7%93%D7%95%D7%90%D7%A8.%0ANever%20send%20mail.",
-            "x-lasso-agent-id": "inbox%20agent",
-            "x-lasso-agent-name": "%D7%A1%D7%95%D7%9B%D7%9F%20%F0%9F%A4%96",
-        },
-    )
-
-    await _run_pre_call(_intent_guardrail("pre_call"), data)
-
-    payload, _, _ = _sent(classify_route)
-    assert payload["sessionInformation"] == {"applicationIntent": "סוכן דואר.\nNever send mail."}
-    assert payload["source"] == {"type": "litellm", "agentId": "inbox agent", "agentName": "סוכן 🤖"}
-
-
-@pytest.mark.asyncio
-async def test_the_length_rules_apply_to_the_decoded_value(classify_route: respx.Route) -> None:
-    name: Final = "ס" * 128
-
-    await _run_pre_call(
-        _intent_guardrail("pre_call"),
-        _request(None, {"x-lasso-encoding": "pct", "x-lasso-agent-name": "%D7%A1" * 128}),
-    )
-
-    payload, _, _ = _sent(classify_route)
-    assert payload["source"] == {"type": "litellm", "agentName": name}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "malformed", ("%zz", "%D7", "Inbox%2", "%FF%FE"), ids=("not-hex", "cut-utf8", "short", "not-utf8")
-)
-async def test_a_value_that_does_not_decode_is_dropped_and_the_call_still_goes_through(
-    classify_route: respx.Route, malformed: str
-) -> None:
-    data: Final = _request(
-        "chat-42",
-        {
-            "x-lasso-encoding": "pct",
-            "x-lasso-application-intent": malformed,
-            "x-lasso-agent-name": malformed,
-            "x-lasso-agent-id": "inbox-agent-7",
-        },
-    )
-
-    await _run_pre_call(_intent_guardrail("pre_call"), data)
-
-    payload, _, _ = _sent(classify_route)
-    assert "sessionInformation" not in payload
-    assert payload["source"] == {"type": "litellm", "agentId": "inbox-agent-7"}
-
-
-@pytest.mark.asyncio
-async def test_without_the_flag_a_percent_sign_is_plain_text(classify_route: respx.Route) -> None:
+async def test_a_percent_sign_is_plain_text(classify_route: respx.Route) -> None:
     await _run_pre_call(
         _intent_guardrail("pre_call"),
         _request("chat-42", {"x-lasso-application-intent": "Refunds up to 100%20 of the order"}),
