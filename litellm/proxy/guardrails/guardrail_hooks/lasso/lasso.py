@@ -7,8 +7,11 @@
 
 import json
 import os
+import re
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
 
 try:
@@ -28,11 +31,14 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from fastapi import HTTPException
+from pydantic import TypeAdapter, ValidationError
+from typing_extensions import NotRequired, ReadOnly
 
 import litellm
 from litellm import DualCache
 from litellm._internal_context import with_service_target
 from litellm._logging import verbose_proxy_logger
+from litellm.constants import SESSION_ID_GENERATED_METADATA_KEY
 from litellm.integrations.custom_guardrail import (
     GUARDRAIL_SESSIONS_TARGET,
     CustomGuardrail,
@@ -58,10 +64,96 @@ class LassoResponse(TypedDict):
     deputies: dict[str, bool]
     findings: dict[str, list[dict[str, object]]]
     messages: list[dict[str, str]] | None
+    is_block: ReadOnly[NotRequired[bool]]
+    intent_findings: ReadOnly[NotRequired[Sequence[Mapping[str, object]]]]
 
 
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
+
+_SESSION_ID_MAX_LENGTH: Final = 100
+_APPLICATION_INTENT_MAX_LENGTH: Final = 2000
+_SESSION_ID_HEADER: Final = "x-session-id"
+_TRACE_ID_HEADER: Final = "x-lasso-trace-id"
+_APPLICATION_INTENT_HEADER: Final = "x-lasso-application-intent"
+_AGENT_ID_HEADER: Final = "x-lasso-agent-id"
+_LITELLM_AGENT_ID_HEADER: Final = "x-litellm-agent-id"
+_AGENT_NAME_HEADER: Final = "x-lasso-agent-name"
+_AGENT_IDENTITY_MAX_LENGTH: Final = 128
+_ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
+_METADATA_CONTAINERS: Final = ("metadata", "litellm_metadata")
+_HEADER_CONTAINERS: Final = ("proxy_server_request", *_METADATA_CONTAINERS)
+_REQUEST_CONTEXT_KEYS: Final = ("litellm_call_id", "litellm_session_id", *_HEADER_CONTAINERS)
+_STR_MAPPING: Final = TypeAdapter(dict[str, object])
+_EMPTY_MAPPING: Final[Mapping[str, object]] = MappingProxyType[str, object]({})
+
+
+def _caller_session_id(data: object) -> str | None:
+    request: Final = _as_str_mapping(data)
+    # LiteLLM's missing_session_id: generate policy mints a new id per call when the caller sent none
+    generated: Final = any(
+        _as_str_mapping(request.get(key)).get(SESSION_ID_GENERATED_METADATA_KEY) for key in _METADATA_CONTAINERS
+    )
+    session_id: Final = None if generated else _bounded_session_id(request.get("litellm_session_id"))
+    # LiteLLM adopts x-session-id only when it looks like an id (8+ letters, digits, - or _), so read any other value here
+    return session_id or _bounded_session_id(_inbound_headers(data).get(_SESSION_ID_HEADER))
+
+
+def _bounded_session_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped: Final = value.strip()
+    return stripped if 0 < len(stripped) <= _SESSION_ID_MAX_LENGTH else None
+
+
+def _as_str_mapping(value: object) -> Mapping[str, object]:
+    try:
+        return _STR_MAPPING.validate_python(value)
+    except ValidationError:
+        return _EMPTY_MAPPING
+
+
+def _inbound_headers(data: object) -> Mapping[str, str]:
+    request: Final = _as_str_mapping(data)
+    candidates: Final = (
+        _as_str_mapping(_as_str_mapping(request.get(key)).get("headers")) for key in _HEADER_CONTAINERS
+    )
+    headers: Final = next((found for found in candidates if found), _EMPTY_MAPPING)
+    return MappingProxyType({name.lower(): value for name, value in headers.items() if isinstance(value, str)})
+
+
+def _agent_identity(value: str | None) -> str | None:
+    """Lasso's rule for an agent id or name: trimmed, 1 to 128 UTF-16 units, no control or format characters."""
+    trimmed: Final = (value or "").strip()
+    utf16_length: Final = len(trimmed.encode("utf-16-le")) // 2
+    if not 0 < utf16_length <= _AGENT_IDENTITY_MAX_LENGTH:
+        return None
+    return None if any(unicodedata.category(char) in ("Cc", "Cf") for char in trimmed) else trimmed
+
+
+def _header_fields(
+    data: object, has_configured_session: bool
+) -> tuple[str | None, str | None, tuple[tuple[str, str], ...]]:
+    """The trace id, application intent and agent (as ``source`` keys) the app sent in its headers.
+
+    The agent goes in ``source`` rather than the request's agentId / agentName, which gateways before 0.9 reject with a
+    400. Newer gateways read it from ``source`` when those are absent. Trace and intent count only with a real session.
+    """
+    headers: Final = _inbound_headers(data)
+    agent_candidates: Final = (
+        # Ours wins, LiteLLM's own agent header (which it also writes into spend metadata) is the fallback
+        (
+            "agentId",
+            _agent_identity(headers.get(_AGENT_ID_HEADER)) or _agent_identity(headers.get(_LITELLM_AGENT_ID_HEADER)),
+        ),
+        ("agentName", _agent_identity(headers.get(_AGENT_NAME_HEADER))),
+    )
+    agent: Final = tuple((key, value) for key, value in agent_candidates if value)
+    if not (has_configured_session or _caller_session_id(data)):
+        return (None, None, agent)
+    trace_id: Final = headers.get(_TRACE_ID_HEADER, "").strip()
+    application_intent: Final = headers.get(_APPLICATION_INTENT_HEADER, "").strip()[:_APPLICATION_INTENT_MAX_LENGTH]
+    return (trace_id.upper() if _ULID_PATTERN.fullmatch(trace_id) else None, application_intent or None, agent)
 
 
 class LassoGuardrailMissingSecrets(Exception):
@@ -113,14 +205,14 @@ class LassoGuardrail(CustomGuardrail):
 
         self.api_base = api_base or os.getenv("LASSO_API_BASE") or "https://server.lasso.security/gateway/v3"
 
+        super().__init__(**kwargs)
+
         verbose_proxy_logger.debug(
             "Lasso guardrail initialized: %s, event_hook: %s, mask: %s",
-            kwargs.get("guardrail_name", "unknown"),
-            kwargs.get("event_hook", "unknown"),
+            self.guardrail_name or "unknown",
+            self.event_hook or "unknown",
             self.mask,
         )
-
-        super().__init__(**kwargs)
 
     @staticmethod
     def _get_field(obj: object, field: str, default: object = None) -> object:
@@ -275,10 +367,9 @@ class LassoGuardrail(CustomGuardrail):
                     )
 
             if response_messages:
-                # Include litellm_call_id from original data for conversation_id consistency
                 response_data: Final = {
+                    **{key: data[key] for key in _REQUEST_CONTEXT_KEYS if key in data},
                     "messages": response_messages,
-                    "litellm_call_id": data.get("litellm_call_id"),
                 }
 
                 # Handle masking for post-call
@@ -317,9 +408,9 @@ class LassoGuardrail(CustomGuardrail):
         """
         Get or generate a conversation_id for this request.
 
-        This method ensures session consistency by using litellm_call_id as a cache key.
-        The same conversation_id is used for both pre-call and post-call hooks within
-        the same request, enabling proper conversation grouping in Lasso UI.
+        A configured conversation_id wins, then the caller's session (``litellm_session_id``, set from
+        ``x-litellm-session-id`` and friends, else the ``x-session-id`` header as sent). Otherwise one id is
+        generated per request, cached by litellm_call_id so the pre-call and post-call hooks share it.
 
         Example:
             >>> guardrail = LassoGuardrail(lasso_api_key="key")
@@ -337,6 +428,10 @@ class LassoGuardrail(CustomGuardrail):
         # Use global conversation_id if set
         if self.conversation_id:
             return self.conversation_id
+
+        caller_session_id: Final = _caller_session_id(data)
+        if caller_session_id:
+            return caller_session_id
 
         # Get the litellm_call_id which is consistent across all hooks for this request
         litellm_call_id: Final = data.get("litellm_call_id")
@@ -763,12 +858,15 @@ class LassoGuardrail(CustomGuardrail):
             data: Request data (used for conversation_id generation and tools extraction)
             cache: Cache instance for storing conversation_id (optional for post-call)
         """
+        # Lasso scores intent per session, so the app's trace and intent headers only count with a real one
+        trace_id, application_intent, agent = _header_fields(data, has_configured_session=bool(self.conversation_id))
         payload: Final[dict[str, object]] = {
-            "messages": messages,
+            "messages": [{**message, "traceId": trace_id} for message in messages] if trace_id else messages,
             "messageType": message_type,
             # Drives the "Used By" badge on Lasso Application API Keys: every call from this
             # integration is attributed as "litellm" on the keys list.
-            "source": {"type": "litellm"},
+            "source": {"type": "litellm", **dict(agent)},
+            **({"sessionInformation": {"applicationIntent": application_intent}} if application_intent else {}),
         }
 
         # Add optional parameters if available
@@ -846,22 +944,26 @@ class LassoGuardrail(CustomGuardrail):
             response: The response dictionary from Lasso API
 
         Raises:
-            HTTPException: If any finding has "action": "BLOCK"
+            HTTPException: If Lasso's ``is_block`` is true, or, from gateways that don't send it, if any finding
+                has "action": "BLOCK"
         """
         if response and response.get("violations_detected") is True:
             violated_deputies: Final = self._parse_violated_deputies(response)
             verbose_proxy_logger.warning("Lasso guardrail detected violations: %s", violated_deputies)
 
-            # Check if any findings have "BLOCK" action
             blocking_violations: Final = self._check_for_blocking_actions(response)
+            # is_block also counts findings that never reach `findings`, such as intent findings
+            is_block: Final = response.get("is_block")
+            should_block: Final = is_block if isinstance(is_block, bool) else bool(blocking_violations)
 
-            if blocking_violations:
-                # Block the request/response for findings with "BLOCK" action
+            if should_block:
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "Violated Lasso guardrail policy",
-                        "detection_message": f"Blocking violations detected: {', '.join(blocking_violations)}",
+                        "detection_message": (
+                            f"Blocking violations detected: {', '.join(blocking_violations) or 'Lasso policy'}"
+                        ),
                         "lasso_response": response,
                     },
                 )
@@ -884,7 +986,8 @@ class LassoGuardrail(CustomGuardrail):
             response: The response dictionary from Lasso API
 
         Returns:
-            List[str]: Names of deputies with blocking violations
+            List[str]: Names of deputies with blocking violations, plus "intent" when an intent finding
+                blocks (a "BLOCK" action that isn't monitor-only, the same rule Lasso's ``is_block`` uses)
 
         Example:
             >>> response = {
@@ -906,6 +1009,10 @@ class LassoGuardrail(CustomGuardrail):
                         if deputy_name not in blocking_violations:
                             blocking_violations.append(deputy_name)
                         break  # No need to check other findings for this deputy
+
+        intent_findings: Final = response.get("intent_findings") or ()
+        if any(finding.get("action") == "BLOCK" and not finding.get("monitorOnly") for finding in intent_findings):
+            blocking_violations.append("intent")
 
         return blocking_violations
 
