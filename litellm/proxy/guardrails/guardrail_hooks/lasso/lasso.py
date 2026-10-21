@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
+from urllib.parse import unquote
 
 try:
     import ulid
@@ -73,11 +74,16 @@ if TYPE_CHECKING:
 
 _SESSION_ID_MAX_LENGTH: Final = 100
 _APPLICATION_INTENT_MAX_LENGTH: Final = 2000
-_TRACE_ID_HEADER: Final = "x-litellm-lasso-trace-id"
-_APPLICATION_INTENT_HEADER: Final = "x-litellm-lasso-application-intent"
-_AGENT_ID_HEADER: Final = "x-litellm-lasso-agent-id"
+_SESSION_ID_HEADER: Final = "x-session-id"
+_TRACE_ID_HEADER: Final = "x-lasso-trace-id"
+_APPLICATION_INTENT_HEADER: Final = "x-lasso-application-intent"
+_AGENT_ID_HEADER: Final = "x-lasso-agent-id"
 _LITELLM_AGENT_ID_HEADER: Final = "x-litellm-agent-id"
-_AGENT_NAME_HEADER: Final = "x-litellm-lasso-agent-name"
+_AGENT_NAME_HEADER: Final = "x-lasso-agent-name"
+# "pct" when the app percent-encoded the free-text headers: a header can't carry non-ASCII text or a newline
+_ENCODING_HEADER: Final = "x-lasso-encoding"
+_ENCODING_PCT: Final = "pct"
+_MALFORMED_PCT: Final = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _AGENT_IDENTITY_MAX_LENGTH: Final = 128
 _ULID_PATTERN: Final = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}", re.IGNORECASE)
 _METADATA_CONTAINERS: Final = ("metadata", "litellm_metadata")
@@ -93,10 +99,15 @@ def _caller_session_id(data: object) -> str | None:
     generated: Final = any(
         _as_str_mapping(request.get(key)).get(SESSION_ID_GENERATED_METADATA_KEY) for key in _METADATA_CONTAINERS
     )
-    session_id: Final = request.get("litellm_session_id")
-    if generated or not isinstance(session_id, str):
+    session_id: Final = None if generated else _bounded_session_id(request.get("litellm_session_id"))
+    # LiteLLM adopts x-session-id only when it looks like an id (8+ letters, digits, - or _), so read any other value here
+    return session_id or _bounded_session_id(_inbound_headers(data).get(_SESSION_ID_HEADER))
+
+
+def _bounded_session_id(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    stripped: Final = session_id.strip()
+    stripped: Final = value.strip()
     return stripped if 0 < len(stripped) <= _SESSION_ID_MAX_LENGTH else None
 
 
@@ -114,6 +125,19 @@ def _inbound_headers(data: object) -> Mapping[str, str]:
     )
     headers: Final = next((found for found in candidates if found), _EMPTY_MAPPING)
     return MappingProxyType({name.lower(): value for name, value in headers.items() if isinstance(value, str)})
+
+
+def _free_text_header(headers: Mapping[str, str], name: str) -> str | None:
+    """A free-text header as the app meant it: percent-decoded when flagged, None when it doesn't decode."""
+    value: Final = headers.get(name)
+    if value is None or headers.get(_ENCODING_HEADER, "").strip().lower() != _ENCODING_PCT:
+        return value
+    if _MALFORMED_PCT.search(value):
+        return None
+    try:
+        return unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        return None
 
 
 def _agent_identity(value: str | None) -> str | None:
@@ -138,15 +162,18 @@ def _header_fields(
         # Ours wins, LiteLLM's own agent header (which it also writes into spend metadata) is the fallback
         (
             "agentId",
-            _agent_identity(headers.get(_AGENT_ID_HEADER)) or _agent_identity(headers.get(_LITELLM_AGENT_ID_HEADER)),
+            _agent_identity(_free_text_header(headers, _AGENT_ID_HEADER))
+            or _agent_identity(headers.get(_LITELLM_AGENT_ID_HEADER)),
         ),
-        ("agentName", _agent_identity(headers.get(_AGENT_NAME_HEADER))),
+        ("agentName", _agent_identity(_free_text_header(headers, _AGENT_NAME_HEADER))),
     )
     agent: Final = tuple((key, value) for key, value in agent_candidates if value)
     if not (has_configured_session or _caller_session_id(data)):
         return (None, None, agent)
     trace_id: Final = headers.get(_TRACE_ID_HEADER, "").strip()
-    application_intent: Final = headers.get(_APPLICATION_INTENT_HEADER, "").strip()[:_APPLICATION_INTENT_MAX_LENGTH]
+    application_intent: Final = (_free_text_header(headers, _APPLICATION_INTENT_HEADER) or "").strip()[
+        :_APPLICATION_INTENT_MAX_LENGTH
+    ]
     return (trace_id.upper() if _ULID_PATTERN.fullmatch(trace_id) else None, application_intent or None, agent)
 
 
@@ -403,8 +430,8 @@ class LassoGuardrail(CustomGuardrail):
         Get or generate a conversation_id for this request.
 
         A configured conversation_id wins, then the caller's session (``litellm_session_id``, set from
-        ``x-litellm-session-id`` and friends). Otherwise one id is generated per request, cached by
-        litellm_call_id so the pre-call and post-call hooks share it.
+        ``x-litellm-session-id`` and friends, else the ``x-session-id`` header as sent). Otherwise one id is
+        generated per request, cached by litellm_call_id so the pre-call and post-call hooks share it.
 
         Example:
             >>> guardrail = LassoGuardrail(lasso_api_key="key")
