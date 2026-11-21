@@ -2361,3 +2361,38 @@ async def test_an_x_session_id_over_the_limit_is_not_a_session(classify_route: r
     payload, messages, _ = _sent(classify_route)
     assert payload["sessionId"] != "s" * 101
     assert all("traceId" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "conversation_id", "scope"),
+    ((None, None, "call"), ("chat-42", None, "caller"), (None, "configured-conversation", "caller")),
+    ids=("generated", "caller-session", "configured"),
+)
+async def test_session_scope_tells_lasso_whether_the_session_is_the_callers(
+    classify_route: respx.Route, session_id: str | None, conversation_id: str | None, scope: str
+) -> None:
+    await _run_pre_call(_intent_guardrail("pre_call", conversation_id), _request(session_id, {}))
+
+    _, _, headers = _sent(classify_route)
+    assert headers["lasso-session-scope"] == scope
+
+
+@pytest.mark.asyncio
+async def test_a_generated_session_pairs_the_request_and_response_of_one_call(classify_route: respx.Route) -> None:
+    guardrail: Final = LassoGuardrail(
+        lasso_api_key="test-key", guardrail_name="intent-guard", event_hook=["pre_call", "post_call"], default_on=True
+    )
+    data: Final = _request(None, {})
+    await _run_pre_call(guardrail, data)
+    _, _, request_headers = _sent(classify_route)
+
+    await guardrail.async_post_call_success_hook(
+        data=data,
+        user_api_key_dict=UserAPIKeyAuth(),
+        response=litellm.ModelResponse(choices=[{"index": 0, "message": {"role": "assistant", "content": "Done"}}]),
+    )
+
+    _, _, response_headers = _sent(classify_route)
+    assert response_headers["lasso-session-scope"] == "call"
+    assert response_headers["lasso-conversation-id"] == request_headers["lasso-conversation-id"]
