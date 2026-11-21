@@ -79,6 +79,9 @@ if TYPE_CHECKING:
 _SESSION_ID_MAX_LENGTH: Final = 100
 _APPLICATION_INTENT_MAX_LENGTH: Final = 2000
 _SESSION_ID_HEADER: Final = "x-session-id"
+# "caller" when lasso-conversation-id is the caller's session, "call" when it was generated for this call alone. With
+# "call" the gateway works out the conversation itself, since LiteLLM re-sends it in full on every call.
+_SESSION_SCOPE_HEADER: Final = "lasso-session-scope"
 _TRACE_ID_HEADER: Final = "x-lasso-trace-id"
 _APPLICATION_INTENT_HEADER: Final = "x-lasso-application-intent"
 _AGENT_ID_HEADER: Final = "x-lasso-agent-id"
@@ -381,8 +384,8 @@ class LassoGuardrail(CustomGuardrail):
 
             if response_messages:
                 # Sharing the caller's metadata bucket records a failure that is let through on the caller's request
-                get_or_create_metadata_bucket(data)  # pyright: ignore[reportUnknownVariableType]  # the helper types the bucket as a bare dict
-                response_data: Final = {
+                get_or_create_metadata_bucket(data)
+                response_data: Final[dict[str, object]] = {  # mutable-ok: _run_lasso_guardrail takes a dict
                     **{key: data[key] for key in _REQUEST_CONTEXT_KEYS if key in data},
                     "messages": response_messages,
                 }
@@ -868,6 +871,8 @@ class LassoGuardrail(CustomGuardrail):
         conversation_id: Final = self._get_or_generate_conversation_id(data, cache)
 
         headers["lasso-conversation-id"] = conversation_id
+        caller_session: Final = self.conversation_id or _caller_session_id(data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
+        headers[_SESSION_SCOPE_HEADER] = "caller" if caller_session else "call"
 
         return headers
 
