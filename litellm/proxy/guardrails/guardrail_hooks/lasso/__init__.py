@@ -20,6 +20,9 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         event_hook=litellm_params.mode,
         default_on=litellm_params.default_on,
         timeout=litellm_params.timeout,
+        unreachable_fallback=litellm_params.unreachable_fallback,
+        fail_on_error=litellm_params.fail_on_error,
+        num_retries=litellm_params.num_retries,
     )
     litellm.logging_callback_manager.add_litellm_callback(_lasso_callback)
 

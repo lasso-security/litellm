@@ -5,10 +5,11 @@
 #
 # +-------------------------------------------------------------+
 
+import asyncio
 import json
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Literal, TypedDict
 
 try:
@@ -19,14 +20,7 @@ except ImportError:
     ulid = None
     ULID_AVAILABLE = False
 
-try:
-    import httpx
-
-    HTTPX_AVAILABLE = True
-except ImportError:
-    httpx = None
-    HTTPX_AVAILABLE = False
-
+import httpx
 from fastapi import HTTPException
 
 import litellm
@@ -39,7 +33,7 @@ from litellm.integrations.custom_guardrail import (
     log_guardrail_information,
 )
 from litellm.integrations.custom_guardrail import dc as global_cache
-from litellm.litellm_core_utils.core_helpers import iter_items
+from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket, iter_items
 from litellm.llms.anthropic.common_utils import (
     anthropic_server_tool_call_params,
     anthropic_server_tool_calls,
@@ -58,6 +52,8 @@ from litellm.proxy.guardrails._content_utils import (
 )
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.llms.openai import ChatCompletionAssistantToolCall
+
+from .failures import UnreachableFallback, call_with_retries, classify_failure
 
 
 class LassoResponse(TypedDict):
@@ -105,6 +101,10 @@ class LassoGuardrail(CustomGuardrail):
         user_id: str | None = None,
         conversation_id: str | None = None,
         mask: bool | None = False,
+        unreachable_fallback: UnreachableFallback = "fail_closed",
+        fail_on_error: bool | None = True,
+        num_retries: int | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         **kwargs,
     ):
         kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
@@ -113,6 +113,10 @@ class LassoGuardrail(CustomGuardrail):
         self.user_id = user_id or os.environ.get("LASSO_USER_ID")
         self.conversation_id = conversation_id or os.environ.get("LASSO_CONVERSATION_ID")
         self.mask = mask or False
+        self.unreachable_fallback: UnreachableFallback = unreachable_fallback
+        self.fail_on_error: bool = fail_on_error is not False
+        self.num_retries: int = num_retries or 0
+        self._sleep: Final = sleep
 
         if self.lasso_api_key is None:
             raise LassoGuardrailMissingSecrets(
@@ -284,10 +288,13 @@ class LassoGuardrail(CustomGuardrail):
                     )
 
             if response_messages:
-                # Include litellm_call_id from original data for conversation_id consistency
-                response_data: Final = {
+                # litellm_call_id keeps the conversation_id, and the shared metadata bucket lets a failure that is let
+                # through be recorded on the caller's request
+                metadata_key, metadata = get_or_create_metadata_bucket(data)  # pyright: ignore[reportUnknownVariableType]  # the helper types the bucket as a bare dict
+                response_data: Final[dict[str, object]] = {  # mutable-ok: _run_lasso_guardrail takes a dict
                     "messages": response_messages,
                     "litellm_call_id": data.get("litellm_call_id"),
+                    metadata_key: metadata,
                 }
 
                 # Handle masking for post-call
@@ -306,10 +313,7 @@ class LassoGuardrail(CustomGuardrail):
                             self._apply_masking_to_model_response(response, masked_messages)
                             verbose_proxy_logger.debug("Applied Lasso masking to model response")
                     except Exception as e:
-                        if isinstance(e, HTTPException):
-                            raise e
-                        verbose_proxy_logger.error("Error in post-call Lasso masking: %s", e)
-                        raise LassoGuardrailAPIError(f"Failed to apply post-call masking: {e}")
+                        await self._handle_api_error(e, "COMPLETION", data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
                 else:
                     # Use the same data for conversation_id consistency (no cache access needed)
                     await self._run_lasso_guardrail(response_data, cache=global_cache, message_type="COMPLETION")
@@ -357,22 +361,13 @@ class LassoGuardrail(CustomGuardrail):
         # Use litellm_call_id as cache key for conversation_id
         cache_key: Final = f"lasso_conversation_id:{litellm_call_id}"
 
-        # Try to get existing conversation_id from cache
-        try:
-            cached_conversation_id: Final = cache.get_cache(cache_key)
-            if cached_conversation_id:
-                return cached_conversation_id
-        except Exception as e:
-            verbose_proxy_logger.warning("Cache retrieval failed: %s", e)
+        # DualCache logs and swallows its own errors, so a cache outage just yields a fresh id
+        cached_conversation_id: Final = cache.get_cache(cache_key)
+        if cached_conversation_id:
+            return cached_conversation_id
 
-        # Generate new conversation_id and store in cache
         generated_id: Final = self._generate_ulid()
-
-        try:
-            cache.set_cache(cache_key, generated_id, ttl=3600)  # Cache for 1 hour
-        except Exception as e:
-            verbose_proxy_logger.warning("Cache storage failed: %s", e)
-
+        cache.set_cache(cache_key, generated_id, ttl=3600)
         return generated_id
 
     async def _run_lasso_guardrail(
@@ -442,8 +437,8 @@ class LassoGuardrail(CustomGuardrail):
             self._process_lasso_response(response)
             return data
         except Exception as e:
-            await self._handle_api_error(e, message_type)
-            return data  # This line won't be reached due to exception, but satisfies type checker
+            await self._handle_api_error(e, message_type, data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
+            return data
 
     async def _handle_masking(
         self,
@@ -485,8 +480,8 @@ class LassoGuardrail(CustomGuardrail):
 
             return data
         except Exception as e:
-            await self._handle_api_error(e, message_type)
-            return data  # This line won't be reached due to exception, but satisfies type checker
+            await self._handle_api_error(e, message_type, data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
+            return data
 
     def _map_masked_messages_back(
         self,
@@ -613,12 +608,39 @@ class LassoGuardrail(CustomGuardrail):
         self,
         error: Exception,
         message_type: Literal["PROMPT", "COMPLETION"],
+        request_data: dict[str, object],  # mutable-ok: LiteLLM records guardrail results on the request
     ) -> None:
-        """Handle API errors with specific error types."""
+        """Raise the failure, or record it and return to let the call through when configured to fail open.
+
+        A Lasso BLOCK verdict (HTTPException) is always raised.
+        """
         if isinstance(error, HTTPException):
             raise error
 
-        # Log error with context
+        failure: Final = classify_failure(error)
+        if (failure.unavailable and self.unreachable_fallback == "fail_open") or not self.fail_on_error:
+            verbose_proxy_logger.warning(
+                "Lasso guardrail could not check the %s, letting it through unchecked: %s",
+                "request" if message_type == "PROMPT" else "response",
+                failure.message,
+                extra={
+                    "guardrail_name": self.guardrail_name,
+                    "message_type": message_type,
+                    "status_code": failure.status_code,
+                    "litellm_call_id": request_data.get("litellm_call_id"),
+                },
+            )
+            self.add_standard_logging_guardrail_information_to_request_data(  # pyright: ignore[reportUnknownMemberType]  # CustomGuardrail types request_data as a bare dict
+                guardrail_json_response={
+                    "fallback": "fail_open",
+                    "error": failure.message,
+                    **({"status_code": failure.status_code} if failure.status_code is not None else {}),
+                },
+                request_data=request_data,
+                guardrail_status="guardrail_failed_to_respond",
+            )
+            return
+
         verbose_proxy_logger.error(
             "Error calling Lasso API: %s",
             error,
@@ -628,21 +650,9 @@ class LassoGuardrail(CustomGuardrail):
                 "error_type": type(error).__name__,
             },
         )
-
-        # Handle specific error types if httpx is available
-        if HTTPX_AVAILABLE:
-            if isinstance(error, httpx.TimeoutException):
-                raise LassoGuardrailAPIError("Lasso API timeout")
-            elif isinstance(error, httpx.HTTPStatusError):
-                if error.response.status_code == 401:
-                    raise LassoGuardrailMissingSecrets("Invalid API key")
-                elif error.response.status_code == 429:
-                    raise LassoGuardrailAPIError("Lasso API rate limit exceeded")
-                else:
-                    raise LassoGuardrailAPIError(f"API error: {error.response.status_code}")
-
-        # Generic error handling
-        raise LassoGuardrailAPIError(f"Failed to verify request safety with Lasso API: {error}")
+        if failure.status_code == 401:
+            raise LassoGuardrailMissingSecrets("Invalid API key")
+        raise LassoGuardrailAPIError(failure.message)
 
     def _log_masking_applied(
         self,
@@ -833,13 +843,18 @@ class LassoGuardrail(CustomGuardrail):
         """Call the Lasso API and return the response."""
         url: Final = api_url or f"{self.api_base}/classify"
         verbose_proxy_logger.debug("Calling Lasso API with messageType: %s", payload.get("messageType"))
-        response: Final = await self.async_handler.post(
-            url=url,
-            headers=headers,
-            json=payload,
-            timeout=self.timeout if self.timeout is not None else 10.0,
-        )
-        response.raise_for_status()
+
+        async def post_once() -> httpx.Response:
+            response: Final = await self.async_handler.post(
+                url=url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout if self.timeout is not None else 10.0,
+            )
+            response.raise_for_status()
+            return response
+
+        response: Final = await call_with_retries(post_once, retries_left=self.num_retries, sleep=self._sleep)
         return response.json()
 
     def _process_lasso_response(self, response: LassoResponse) -> None:
