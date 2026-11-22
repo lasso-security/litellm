@@ -6,6 +6,7 @@
 # +-------------------------------------------------------------+
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,9 @@ _SESSION_ID_HEADER: Final = "x-session-id"
 # "caller" when lasso-conversation-id is the caller's session, "call" when it was generated for this call alone. With
 # "call" the gateway works out the conversation itself, since LiteLLM re-sends it in full on every call.
 _SESSION_SCOPE_HEADER: Final = "lasso-session-scope"
+# Who the conversation belongs to in LiteLLM (virtual key and end user), hashed, so the gateway keeps two users'
+# identical openings apart when it works out the conversation itself.
+_CONVERSATION_SCOPE_HEADER: Final = "lasso-conversation-scope"
 _TRACE_ID_HEADER: Final = "x-lasso-trace-id"
 _APPLICATION_INTENT_HEADER: Final = "x-lasso-application-intent"
 _AGENT_ID_HEADER: Final = "x-lasso-agent-id"
@@ -105,6 +109,17 @@ def _caller_session_id(data: object) -> str | None:
     session_id: Final = None if generated else _bounded_session_id(request.get("litellm_session_id"))
     # LiteLLM adopts x-session-id only when it looks like an id (8+ letters, digits, - or _), so read any other value here
     return session_id or _bounded_session_id(_inbound_headers(data).get(_SESSION_ID_HEADER))
+
+
+def _conversation_scope(data: object) -> str | None:
+    request: Final = _as_str_mapping(data)
+    metadata: Final = next(
+        (found for found in (_as_str_mapping(request.get(key)) for key in _METADATA_CONTAINERS) if found),
+        _EMPTY_MAPPING,
+    )
+    owner: Final = (metadata.get("user_api_key_hash"), metadata.get("user_api_key_end_user_id") or request.get("user"))
+    parts: Final = tuple(part if isinstance(part, str) else "" for part in owner)
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest() if any(parts) else None
 
 
 def _bounded_session_id(value: object) -> str | None:
@@ -873,6 +888,9 @@ class LassoGuardrail(CustomGuardrail):
         headers["lasso-conversation-id"] = conversation_id
         caller_session: Final = self.conversation_id or _caller_session_id(data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
         headers[_SESSION_SCOPE_HEADER] = "caller" if caller_session else "call"
+        conversation_scope: Final = _conversation_scope(data)  # pyright: ignore[reportUnknownArgumentType]  # hooks get the request as a bare dict
+        if conversation_scope:
+            headers[_CONVERSATION_SCOPE_HEADER] = conversation_scope
 
         return headers
 

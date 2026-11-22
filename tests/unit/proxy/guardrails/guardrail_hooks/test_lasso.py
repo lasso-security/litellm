@@ -2392,6 +2392,30 @@ async def test_session_scope_tells_lasso_whether_the_session_is_the_callers(
     assert headers["lasso-session-scope"] == scope
 
 
+def _owned_request(key_hash: str | None, end_user: str | None) -> dict[str, object]:
+    metadata: Final = {"user_api_key_hash": key_hash, "user_api_key_end_user_id": end_user}
+    return {**_request(None, {}), "metadata": {k: v for k, v in metadata.items() if v is not None}}
+
+
+@pytest.mark.asyncio
+async def test_conversation_scope_keeps_two_users_identical_openings_apart(classify_route: respx.Route) -> None:
+    for owner in (("key-a", "alice"), ("key-a", "bob"), ("key-a", "alice")):
+        await _run_pre_call(_intent_guardrail("pre_call"), _owned_request(*owner))
+
+    scopes: Final = [call.request.headers["lasso-conversation-scope"] for call in classify_route.calls]
+    assert scopes[0] != scopes[1]
+    assert scopes[0] == scopes[2]
+    assert "alice" not in scopes[0] and "key-a" not in scopes[0]
+
+
+@pytest.mark.asyncio
+async def test_no_conversation_scope_without_a_key_or_end_user(classify_route: respx.Route) -> None:
+    await _run_pre_call(_intent_guardrail("pre_call"), _request(None, {}))
+
+    _, _, headers = _sent(classify_route)
+    assert "lasso-conversation-scope" not in headers
+
+
 @pytest.mark.asyncio
 async def test_a_generated_session_pairs_the_request_and_response_of_one_call(classify_route: respx.Route) -> None:
     guardrail: Final = LassoGuardrail(
