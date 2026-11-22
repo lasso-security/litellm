@@ -26,14 +26,14 @@ class LassoFailure:
 
 
 def classify_failure(error: Exception) -> LassoFailure:
-    """Lasso is unavailable when it timed out, could not be reached, or answered 408, 429 or 5xx."""
+    """Lasso is unavailable when it timed out, could not be reached, answered 408, 429 or 5xx, or its edge throttled the call."""
     match error:
         case httpx.TimeoutException() | litellm.Timeout():
             return LassoFailure("Lasso API timeout", unavailable=True)
         case httpx.HTTPStatusError(response=response):
             return LassoFailure(
                 _status_message(response.status_code),
-                unavailable=response.status_code in UNAVAILABLE_STATUSES,
+                unavailable=response.status_code in UNAVAILABLE_STATUSES or _is_edge_throttle(response),
                 status_code=response.status_code,
                 retry_after_seconds=_retry_after_seconds(next(iter(response.headers.get_list("retry-after")), None)),
             )
@@ -70,6 +70,11 @@ async def call_with_retries(
             raise
         await sleep(wait)
     return await call_with_retries(call, retries_left - 1, sleep, attempt + 1)
+
+
+def _is_edge_throttle(response: httpx.Response) -> bool:
+    """Lasso's edge firewall throttles bursts with a 403 page; Lasso itself answers a refused key or scope as JSON."""
+    return response.status_code == 403 and not response.headers.get("content-type", "").startswith("application/json")
 
 
 def _status_message(status_code: int) -> str:

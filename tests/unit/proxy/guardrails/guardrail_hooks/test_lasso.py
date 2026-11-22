@@ -1778,6 +1778,7 @@ _UNAVAILABLE_ANSWERS: Final = {
     "rate_limited": httpx.Response(429, headers={"Retry-After": "1"}),
     "request_timeout": httpx.Response(408),
     "server_error": httpx.Response(500),
+    "edge_throttle": httpx.Response(403, html="<html><body>403 Forbidden</body></html>"),
     "unavailable": httpx.Response(503),
     "connect_error": httpx.ConnectError("connection refused"),
     "read_timeout": httpx.ReadTimeout("read timed out"),
@@ -1820,6 +1821,19 @@ async def test_fail_open_on_unreachable_still_fails_a_rejected_api_key(
     respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(401))
 
     with pytest.raises(LassoGuardrailMissingSecrets):
+        await _pre_call(_guardrail(unreachable_fallback="fail_open"), {"messages": [{"role": "user", "content": "Hi"}]})
+
+
+@pytest.mark.asyncio
+async def test_fail_open_on_unreachable_still_fails_a_refused_scope(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx_mock.post(_CLASSIFY_URL).mock(
+        return_value=httpx.Response(403, json={"statusCode": 403, "message": "Forbidden"})
+    )
+
+    with pytest.raises(LassoGuardrailAPIError):
         await _pre_call(_guardrail(unreachable_fallback="fail_open"), {"messages": [{"role": "user", "content": "Hi"}]})
 
 
