@@ -1046,9 +1046,8 @@ GuardrailNumRetries: TypeAlias = Annotated[
             "How many more times to send a guardrail check whose connection timed out waiting for the answer "
             "or was dropped after the request went out. Each retry opens a fresh connection and gets the full "
             "timeout. Connect failures, HTTP error statuses and BLOCKED verdicts are not retried. Unset or 0 "
-            "sends each check once, and the most allowed is 5. Implemented by guardrail='generic_guardrail_api'. "
-            "guardrail='lasso' also retries connect failures and Lasso's 408, 429 and 5xx answers, waiting out a "
-            "Retry-After of up to 5 seconds. Other guardrails ignore it."
+            "sends each check once, and the most allowed is 5. Implemented by guardrail='generic_guardrail_api', "
+            "other guardrails ignore it."
         ),
     ),
 ]
@@ -1219,7 +1218,7 @@ class BaseLitellmParams(ContentFilterConfigModel):  # works for new and patch up
         default=True,
         description=(
             "Whether to fail the request if the guardrail encounters an error. "
-            "Implemented by guardrail='model_armor', 'generic_guardrail_api', 'crowdstrike_aidr' and 'lasso'. "
+            "Implemented by guardrail='model_armor', 'generic_guardrail_api' and 'crowdstrike_aidr'. "
             "True (default) raises the error. False logs a critical error and lets the request proceed, "
             "so only a valid guardrail response can block or modify it."
         ),
@@ -1252,7 +1251,6 @@ class BaseLitellmParams(ContentFilterConfigModel):  # works for new and patch up
         description=(
             "Behavior when a guardrail endpoint is unreachable due to network errors. "
             "Implemented by guardrail='generic_guardrail_api', 'agent_365', 'akto', 'vigil_guard', 'repelloai', 'headroom', 'compresr', and 'typesafe'. "
-            "guardrail='lasso' also treats Lasso's timeouts and 408, 429 and 5xx answers as unreachable. "
             "'fail_closed' raises an error (default). 'fail_open' logs a critical error and allows the request to proceed. "
             "Also implemented by guardrail='decision_model'."
         ),
