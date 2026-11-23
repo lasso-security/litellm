@@ -20,7 +20,7 @@ class LassoGuardrailConfigModelOptionalParams(LiteLLMBaseModel):
     unreachable_fallback: Literal["fail_closed", "fail_open"] | None = Field(
         default="fail_closed",
         description=(
-            "What to do when Lasso can't be reached, times out, or answers 408, 429 or 5xx. "
+            "What to do when Lasso can't be reached, times out, or answers 408, 429, 502, 503 or 504. "
             "'fail_closed' (default) fails the request. 'fail_open' lets it through unchecked and records the failure "
             "in the request's guardrail logs."
         ),
