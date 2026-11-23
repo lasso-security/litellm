@@ -1777,7 +1777,6 @@ async def _pre_call(guardrail: LassoGuardrail, data: dict) -> object:
 _UNAVAILABLE_ANSWERS: Final = {
     "rate_limited": httpx.Response(429, headers={"Retry-After": "1"}),
     "request_timeout": httpx.Response(408),
-    "server_error": httpx.Response(500),
     "edge_throttle": httpx.Response(403, html="<html><body>403 Forbidden</body></html>"),
     "unavailable": httpx.Response(503),
     "connect_error": httpx.ConnectError("connection refused"),
@@ -1821,6 +1820,17 @@ async def test_fail_open_on_unreachable_still_fails_a_rejected_api_key(
     respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(401))
 
     with pytest.raises(LassoGuardrailMissingSecrets):
+        await _pre_call(_guardrail(unreachable_fallback="fail_open"), {"messages": [{"role": "user", "content": "Hi"}]})
+
+
+@pytest.mark.asyncio
+async def test_fail_open_on_unreachable_still_fails_a_lasso_server_error(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx_mock.post(_CLASSIFY_URL).mock(return_value=httpx.Response(500))
+
+    with pytest.raises(LassoGuardrailAPIError):
         await _pre_call(_guardrail(unreachable_fallback="fail_open"), {"messages": [{"role": "user", "content": "Hi"}]})
 
 
@@ -2238,8 +2248,8 @@ async def test_the_longest_agent_name_lasso_accepts_is_sent(classify_route: resp
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "answer",
-    (httpx.Response(429, headers={"Retry-After": "30"}), httpx.Response(400), httpx.Response(401)),
-    ids=("retry_after_too_long", "bad_request", "unauthorized"),
+    (httpx.Response(429, headers={"Retry-After": "30"}), httpx.Response(400), httpx.Response(401), httpx.Response(500)),
+    ids=("retry_after_too_long", "bad_request", "unauthorized", "server_error"),
 )
 async def test_retry_skips_answers_not_worth_retrying(
     answer: httpx.Response, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch

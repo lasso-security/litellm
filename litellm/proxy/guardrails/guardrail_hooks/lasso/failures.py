@@ -11,7 +11,8 @@ UnreachableFallback = Literal["fail_closed", "fail_open"]
 
 _T = TypeVar("_T")
 
-UNAVAILABLE_STATUSES: Final = frozenset({408, 429, 500, 502, 503, 504})
+# Not 500: that is Lasso failing on this call, which must not let it through unchecked.
+UNAVAILABLE_STATUSES: Final = frozenset({408, 429, 502, 503, 504})
 MAX_RETRY_WAIT_SECONDS: Final = 5.0
 _BASE_BACKOFF_SECONDS: Final = 0.25
 _MAX_BACKOFF_SECONDS: Final = 2.0
@@ -26,7 +27,7 @@ class LassoFailure:
 
 
 def classify_failure(error: Exception) -> LassoFailure:
-    """Lasso is unavailable when it timed out, could not be reached, answered 408, 429 or 5xx, or its edge throttled the call."""
+    """Lasso is unavailable when it timed out, could not be reached, answered 408, 429, 502, 503 or 504, or its edge throttled the call."""
     match error:
         case httpx.TimeoutException() | litellm.Timeout():
             return LassoFailure("Lasso API timeout", unavailable=True)
